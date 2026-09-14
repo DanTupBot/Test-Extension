@@ -1,0 +1,26 @@
+{
+	"version": "0.1.0",
+	"configurations": [
+		{
+			"name": "Extension",
+			"type": "extensionHost",
+			"runtimeExecutable": "${execPath}",
+			"args": [
+				"--extensionDevelopmentPath=${workspaceFolder}"
+			],
+			"preLaunchTask": "npm: watch",
+			"presentation": {
+				"order": 0
+			},
+			"request": "launch",
+			"outFiles": [
+				"${workspaceFolder}/out/**/*.js"
+			],
+			"smartStep": true,
+			"skipFiles": [
+				"<node_internals>/**",
+				"**/app/out/vs/**"
+			]
+		}
+	]
+}

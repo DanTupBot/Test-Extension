@@ -1,0 +1,65 @@
+{
+	"name": "test-extension",
+	"displayName": "Test Extension",
+	"description": "An extension for testing automated publishing. Not useful to you.",
+	"version": "0.1.0-dev",
+	"publisher": "Dart-Code",
+	"engines": {
+		"vscode": "^1.101.0"
+	},
+	"extensionKind": [
+		"workspace"
+	],
+	"capabilities": {
+		"virtualWorkspaces": {
+			"supported": "limited",
+			"description": "Some functionality may be limited for remote files in virtual workspaces."
+		},
+		"untrustedWorkspaces": {
+			"supported": false
+		}
+	},
+	"license": "SEE LICENSE IN LICENSE",
+	"bugs": {
+		"url": "https://github.com/Dart-Code/Test-Extension/issues"
+	},
+	"homepage": "https://dartcode.org/",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/Dart-Code/Test-Extension.git"
+	},
+	"categories": [
+	],
+	"keywords": [],
+	"icon": "media/test.png",
+	"activationEvents": [
+		"*"
+	],
+	"main": "./out/dist/extension",
+	"contributes": {
+	},
+	"scripts": {
+		"vscode:prepublish": "webpack --mode production",
+		"build": "webpack --mode development --stats errors-only",
+		"watch": "webpack --mode development --watch"
+	},
+	"dependencies": {},
+	"devDependencies": {
+		"@types/node": "^24.0.0",
+		"@types/vscode": "~1.101.0",
+		"source-map-support": "^0.5.21",
+		"ts-loader": "^9.5.7",
+		"typescript": "^6.0.3",
+		"webpack-cli": "^6.0.1",
+		"webpack": "^5.102.0"
+	},
+	"optionalDependencies": {
+		"bufferutil": "^4.0.9",
+		"utf-8-validate": "^6.0.5"
+	},
+	"overrides": {
+		"brace-expansion": "^5.0.7",
+		"diff": "^4.0.4",
+		"serialize-javascript": "^7.0.7"
+	}
+}
