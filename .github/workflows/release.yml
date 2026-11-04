@@ -473,9 +473,9 @@ jobs:
           git commit -am "Set version to $NEXT_DEV_VERSION"
 
           if [ -n "$COMPANION_VERSION" ]; then
-            git push origin "HEAD:$DEFAULT_BRANCH" "refs/tags/v$PRIMARY_VERSION" "refs/tags/v$COMPANION_VERSION"
+            git push --atomic origin "HEAD:$DEFAULT_BRANCH" "refs/tags/v$PRIMARY_VERSION" "refs/tags/v$COMPANION_VERSION"
           else
-            git push origin "HEAD:$DEFAULT_BRANCH" "refs/tags/v$PRIMARY_VERSION"
+            git push --atomic origin "HEAD:$DEFAULT_BRANCH" "refs/tags/v$PRIMARY_VERSION"
           fi
 
       - name: Create GitHub Release (stable only)
@@ -487,7 +487,13 @@ jobs:
           PKG_NAME: ${{ needs.package.outputs.pkg_name }}
         run: |
           if gh release view "v$PRIMARY_VERSION" >/dev/null 2>&1; then
-            echo "GitHub Release 'v$PRIMARY_VERSION' already exists."
+            EXISTING_ASSET=$(gh release view "v$PRIMARY_VERSION" --json assets --jq --arg name "$PRIMARY_VSIX" '.assets[] | select(.name == $name) | .name')
+            if [ -z "$EXISTING_ASSET" ]; then
+              echo "GitHub Release 'v$PRIMARY_VERSION' exists but is missing '$PRIMARY_VSIX'; uploading asset..."
+              gh release upload "v$PRIMARY_VERSION" "$PRIMARY_VSIX"
+            else
+              echo "GitHub Release 'v$PRIMARY_VERSION' and asset '$PRIMARY_VSIX' already exist."
+            fi
             exit 0
           fi
 
