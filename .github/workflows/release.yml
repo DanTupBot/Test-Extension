@@ -114,12 +114,21 @@ jobs:
           CURRENT_SUITE_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq '.check_suite_id')
           TARGET_SHA="$GITHUB_SHA"
 
-          # Fetch latest check runs for the target commit, excluding this Release workflow's check suite.
+          # Fetch latest check runs for the target commit, excluding this Release workflow's check suite
+          # and any check runs from previous Release workflow attempts on the same commit.
           get_filtered_checks() {
             local sha="$1"
             gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs" --paginate --slurp \
               | jq --argjson suite_id "$CURRENT_SUITE_ID" '
-                  [.[].check_runs[] | select(.check_suite.id != $suite_id)]
+                  [
+                    .[].check_runs[]
+                    | select(
+                        .check_suite.id != $suite_id
+                        and .name != "Package Extension"
+                        and .name != "Publish Extension"
+                        and .name != "Post-Release Tests"
+                      )
+                  ]
                   | group_by(.name)
                   | map(max_by(.id))
                 '
@@ -129,13 +138,13 @@ jobs:
           COUNT=$(echo "$CHECKS" | jq 'length')
 
           # If HEAD is a "Set version to X.Y.Z-dev" commit pushed by a previous automated release
-          # (which does not trigger on: push CI when pushed with GITHUB_TOKEN), walk back past the
+          # (which does not trigger on: push CI when pushed with GITHUB_TOKEN), walk back past any
           # automated version-bump commits to verify the underlying code commit's CI status.
           if [ "$COUNT" -eq 0 ]; then
             COMMIT_SUBJECT=$(git log -1 --format=%s "$TARGET_SHA")
             if [[ "$COMMIT_SUBJECT" =~ ^Set\ version\ to\ [0-9]+\.[0-9]+\.[0-9]+-dev$ ]]; then
               CANDIDATE_SHA=$(git rev-parse "${TARGET_SHA}~1")
-              while [[ "$(git log -1 --format=%s "$CANDIDATE_SHA")" =~ ^Publish\ v[0-9]+\.[0-9]+\.[0-9]+$ ]]; do
+              while [[ "$(git log -1 --format=%s "$CANDIDATE_SHA")" =~ ^(Publish\ v[0-9]+\.[0-9]+\.[0-9]+|Set\ version\ to\ [0-9]+\.[0-9]+\.[0-9]+-dev)$ ]]; do
                 CANDIDATE_SHA=$(git rev-parse "${CANDIDATE_SHA}~1")
               done
               echo "HEAD ($TARGET_SHA) is an automated version bump commit; checking underlying commit $CANDIDATE_SHA..."
@@ -412,17 +421,17 @@ jobs:
               exit 1
             fi
             if [ "$RELEASE_TYPE" = "pre-release" ]; then
-              echo "[Dry Run] Would execute: npx vsce publish --oidc --pre-release --packagePath $PRIMARY_VSIX"
+              echo "[Dry Run] Would execute: npx vsce publish --oidc --skip-duplicate --pre-release --packagePath $PRIMARY_VSIX"
             else
-              echo "[Dry Run] Would execute: npx vsce publish --oidc --packagePath $PRIMARY_VSIX"
-              echo "[Dry Run] Would execute: npx vsce publish --oidc --pre-release --packagePath $COMPANION_VSIX"
+              echo "[Dry Run] Would execute: npx vsce publish --oidc --skip-duplicate --packagePath $PRIMARY_VSIX"
+              echo "[Dry Run] Would execute: npx vsce publish --oidc --skip-duplicate --pre-release --packagePath $COMPANION_VSIX"
             fi
           else
             if [ "$RELEASE_TYPE" = "pre-release" ]; then
-              npx vsce publish --oidc --pre-release --packagePath "$PRIMARY_VSIX"
+              npx vsce publish --oidc --skip-duplicate --pre-release --packagePath "$PRIMARY_VSIX"
             else
-              npx vsce publish --oidc --packagePath "$PRIMARY_VSIX"
-              npx vsce publish --oidc --pre-release --packagePath "$COMPANION_VSIX"
+              npx vsce publish --oidc --skip-duplicate --packagePath "$PRIMARY_VSIX"
+              npx vsce publish --oidc --skip-duplicate --pre-release --packagePath "$COMPANION_VSIX"
             fi
           fi
 
