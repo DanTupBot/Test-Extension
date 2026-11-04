@@ -29,6 +29,8 @@ on:
 
 permissions:
   contents: read
+  actions: read
+  checks: read
 
 concurrency:
   group: release
@@ -348,6 +350,7 @@ jobs:
           fetch-depth: 0
 
       - name: Verify branch and Merge Queue before publishing
+        id: check_state
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_OWNER: ${{ github.repository_owner }}
@@ -356,16 +359,24 @@ jobs:
           PRIMARY_VERSION: ${{ needs.package.outputs.primary_version }}
           COMPANION_VERSION: ${{ needs.package.outputs.companion_version }}
         run: |
+          if [ -n "$(git ls-remote origin "refs/tags/v$PRIMARY_VERSION")" ]; then
+            git fetch origin "refs/tags/v$PRIMARY_VERSION:refs/tags/v$PRIMARY_VERSION"
+            TAG_PARENT_SHA=$(git rev-parse "v${PRIMARY_VERSION}~1" 2>/dev/null || true)
+            if [ "$TAG_PARENT_SHA" = "$GITHUB_SHA" ]; then
+              echo "Tag 'v$PRIMARY_VERSION' was already pushed from $GITHUB_SHA in a previous attempt; skipping git push."
+              echo "already_pushed=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::Tag 'v$PRIMARY_VERSION' already exists on origin (parent $TAG_PARENT_SHA != $GITHUB_SHA)."
+            exit 1
+          fi
+
           REMOTE_SHA=$(git ls-remote origin "refs/heads/$DEFAULT_BRANCH" | awk '{print $1}')
           if [ "$REMOTE_SHA" != "$GITHUB_SHA" ]; then
             echo "::error::Remote $DEFAULT_BRANCH ($REMOTE_SHA) has moved since packaging ($GITHUB_SHA). Aborting publish."
             exit 1
           fi
 
-          if [ -n "$(git ls-remote origin "refs/tags/v$PRIMARY_VERSION")" ]; then
-            echo "::error::Tag 'v$PRIMARY_VERSION' already exists on origin."
-            exit 1
-          fi
           if [ -n "$COMPANION_VERSION" ] && [ -n "$(git ls-remote origin "refs/tags/v$COMPANION_VERSION")" ]; then
             echo "::error::Tag 'v$COMPANION_VERSION' already exists on origin."
             exit 1
@@ -394,6 +405,8 @@ jobs:
             echo "::error::Merge queue on $DEFAULT_BRANCH is not empty ($TOTAL_COUNT PR(s) queued)."
             exit 1
           fi
+
+          echo "already_pushed=false" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node v22
         uses: actions/setup-node@v7
@@ -436,6 +449,7 @@ jobs:
           fi
 
       - name: Commit, Tag, and Push to default branch
+        if: steps.check_state.outputs.already_pushed != 'true'
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           PRIMARY_VERSION: ${{ needs.package.outputs.primary_version }}
@@ -472,6 +486,11 @@ jobs:
           PRIMARY_VSIX: ${{ needs.package.outputs.primary_vsix }}
           PKG_NAME: ${{ needs.package.outputs.pkg_name }}
         run: |
+          if gh release view "v$PRIMARY_VERSION" >/dev/null 2>&1; then
+            echo "GitHub Release 'v$PRIMARY_VERSION' already exists."
+            exit 0
+          fi
+
           MAJOR_MINOR=$(echo "$PRIMARY_VERSION" | cut -d. -f1,2 | tr '.' '-')
           if [ "$PKG_NAME" = "dart-code" ]; then
             RELEASE_TITLE="Dart Code v$PRIMARY_VERSION"
