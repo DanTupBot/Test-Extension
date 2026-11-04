@@ -86,14 +86,24 @@ jobs:
             exit 1
           fi
 
+          # Ensure no non-release commits landed on the branch since the workflow was triggered.
+          if [ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]; then
+            NON_RELEASE_COMMITS=$(git log --format=%s "${GITHUB_SHA}..HEAD" | grep -vE '^(Publish v[0-9]+\.[0-9]+\.[0-9]+|Set version to [0-9]+\.[0-9]+\.[0-9]+-dev)$' || true)
+            if [ -n "$NON_RELEASE_COMMITS" ]; then
+              echo "::error::Branch $GITHUB_REF_NAME has new commits since workflow was triggered ($GITHUB_SHA)."
+              exit 1
+            fi
+          fi
+
           PKG_NAME=$(node -p "require('./package.json').name")
           PKG_VERSION=$(node -p "require('./package.json').version")
 
-          if [ "$RELEASE_TYPE" = "stable" ]; then
-            if [ -z "$INPUT_VERSION" ]; then
-              echo "::error::An explicit version (X.Y.Z) is required for stable releases."
-              exit 1
-            fi
+          if [ "$RELEASE_TYPE" = "stable" ] && [ -z "$INPUT_VERSION" ]; then
+            echo "::error::An explicit version (X.Y.Z) is required for stable releases."
+            exit 1
+          fi
+
+          if [ -n "$INPUT_VERSION" ]; then
             if [[ ! "$INPUT_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
               echo "::error::Version '$INPUT_VERSION' must match 'X.Y.Z'."
               exit 1
@@ -101,41 +111,24 @@ jobs:
             MAJOR="${BASH_REMATCH[1]}"
             MINOR="${BASH_REMATCH[2]}"
             PATCH="${BASH_REMATCH[3]}"
-            if [ $((MINOR % 2)) -ne 0 ]; then
+            if [ "$RELEASE_TYPE" = "stable" ] && [ $((MINOR % 2)) -ne 0 ]; then
               echo "::error::Stable version '$INPUT_VERSION' must have an even minor version."
+              exit 1
+            fi
+            if [ "$RELEASE_TYPE" = "pre-release" ] && [ $((MINOR % 2)) -ne 1 ]; then
+              echo "::error::Pre-release version '$INPUT_VERSION' must have an odd minor version."
               exit 1
             fi
             VERSION="$INPUT_VERSION"
           else
-            if [ -n "$INPUT_VERSION" ]; then
-              if [[ ! "$INPUT_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-                echo "::error::Version '$INPUT_VERSION' must match 'X.Y.Z'."
-                exit 1
-              fi
-              MAJOR="${BASH_REMATCH[1]}"
-              MINOR="${BASH_REMATCH[2]}"
-              PATCH="${BASH_REMATCH[3]}"
-              if [ $((MINOR % 2)) -ne 1 ]; then
-                echo "::error::Pre-release version '$INPUT_VERSION' must have an odd minor version."
-                exit 1
-              fi
-              VERSION="$INPUT_VERSION"
-            else
-              if [[ ! "$PKG_VERSION" =~ ^([0-9]+)\.([0-9]+)\.0-dev$ ]]; then
-                echo "::error::Expected package.json version to match 'X.Y.0-dev' to auto-calculate pre-release version, but found '$PKG_VERSION'."
-                exit 1
-              fi
-              BASE_MAJOR="${BASH_REMATCH[1]}"
-              BASE_MINOR="${BASH_REMATCH[2]}"
-              if [ $((BASE_MINOR % 2)) -ne 0 ]; then
-                echo "::error::Expected package.json minor version ($BASE_MINOR in $PKG_VERSION) to be an even number."
-                exit 1
-              fi
-              MAJOR="$BASE_MAJOR"
-              MINOR=$((BASE_MINOR - 1))
-              PATCH=$(date -u +%Y%m%d)
-              VERSION="${MAJOR}.${MINOR}.${PATCH}"
+            if [[ ! "$PKG_VERSION" =~ ^([0-9]+)\.([0-9]+)\.0-dev$ ]]; then
+              echo "::error::Expected package.json version to match 'X.Y.0-dev', but found '$PKG_VERSION'."
+              exit 1
             fi
+            MAJOR="${BASH_REMATCH[1]}"
+            MINOR=$(( ${BASH_REMATCH[2]} - 1 ))
+            PATCH=$(date -u +%Y%m%d)
+            VERSION="${MAJOR}.${MINOR}.${PATCH}"
           fi
 
           VSIX="${PKG_NAME}-${VERSION}.vsix"
@@ -144,13 +137,14 @@ jobs:
 
           # If tag v$VERSION already exists, only allow proceeding if this is a retry of a stable
           # release whose tag is at HEAD (patch branch) or HEAD~1 (default branch after -dev bump).
-          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
-            TAG_SHA=$(git rev-parse "v$VERSION")
+          if git rev-parse "v$VERSION^{commit}" >/dev/null 2>&1; then
+            TAG_SHA=$(git rev-parse "v$VERSION^{commit}")
             HEAD_SHA=$(git rev-parse HEAD)
             PARENT_SHA=$(git rev-parse HEAD~1 2>/dev/null || true)
-            if [ "$RELEASE_TYPE" = "stable" ] && { [ "$TAG_SHA" = "$HEAD_SHA" ] || [ "$TAG_SHA" = "$PARENT_SHA" ]; }; then
+            HEAD_SUBJECT=$(git log -1 --format=%s HEAD)
+            if [ "$RELEASE_TYPE" = "stable" ] && { [ "$TAG_SHA" = "$HEAD_SHA" ] || { [ "$TAG_SHA" = "$PARENT_SHA" ] && [[ "$HEAD_SUBJECT" =~ ^Set\ version\ to\ [0-9]+\.[0-9]+\.[0-9]+-dev$ ]]; }; }; then
               echo "Tag 'v$VERSION' was already pushed ($TAG_SHA); checking out 'v$VERSION' to retry release steps."
-              git checkout "v$VERSION"
+              git checkout --recurse-submodules "v$VERSION"
               ALREADY_PUSHED="true"
             else
               echo "::error::Git tag 'v$VERSION' already exists."
@@ -158,21 +152,22 @@ jobs:
             fi
           else
             # Validate version against current package.json on fresh runs.
-            if [ "$RELEASE_TYPE" = "stable" ]; then
-              if [ "$GITHUB_REF_NAME" = "$DEFAULT_BRANCH" ] && [ "$PATCH" -eq 0 ]; then
-                if [ "$PKG_VERSION" != "${MAJOR}.${MINOR}.0-dev" ]; then
-                  echo "::error::Stable version '$VERSION' does not match package.json version '$PKG_VERSION' on $DEFAULT_BRANCH."
-                  exit 1
-                fi
-                NEXT_DEV_VERSION="${MAJOR}.$((MINOR + 2)).0-dev"
-              else
-                if [[ "$PKG_VERSION" != "${MAJOR}.${MINOR}."* ]]; then
-                  echo "::error::Patch version '$VERSION' does not match major.minor of package.json version '$PKG_VERSION'."
-                  exit 1
-                fi
-                if [ "$GITHUB_REF_NAME" = "$DEFAULT_BRANCH" ] && [[ "$PKG_VERSION" == *-dev ]]; then
-                  NEXT_DEV_VERSION="$PKG_VERSION"
-                fi
+            if [ "$RELEASE_TYPE" = "pre-release" ]; then
+              EXPECTED_DEV="${MAJOR}.$((MINOR + 1)).0-dev"
+              if [ "$PKG_VERSION" != "$EXPECTED_DEV" ]; then
+                echo "::error::Pre-release version '$VERSION' requires package.json to be '$EXPECTED_DEV', but found '$PKG_VERSION'."
+                exit 1
+              fi
+            elif [ "$GITHUB_REF_NAME" = "$DEFAULT_BRANCH" ]; then
+              if [ "$PATCH" -ne 0 ] || [ "$PKG_VERSION" != "${MAJOR}.${MINOR}.0-dev" ]; then
+                echo "::error::Stable release '$VERSION' on $DEFAULT_BRANCH requires patch=0 and package.json '${MAJOR}.${MINOR}.0-dev' (found '$PKG_VERSION')."
+                exit 1
+              fi
+              NEXT_DEV_VERSION="${MAJOR}.$((MINOR + 2)).0-dev"
+            else
+              if [ "$PATCH" -eq 0 ] || [[ "$PKG_VERSION" != "${MAJOR}.${MINOR}."* ]]; then
+                echo "::error::Patch release '$VERSION' on branch '$GITHUB_REF_NAME' requires patch>0 and matching major.minor in package.json (found '$PKG_VERSION')."
+                exit 1
               fi
             fi
 
@@ -265,6 +260,7 @@ jobs:
         with:
           name: ${{ steps.prepare.outputs.vsix }}
           path: ${{ steps.prepare.outputs.vsix }}
+          overwrite: true
           if-no-files-found: error
 
       - name: Commit, Tag, and Push
@@ -299,7 +295,7 @@ jobs:
           PKG_NAME: ${{ steps.prepare.outputs.pkg_name }}
         run: |
           if gh release view "v$VERSION" >/dev/null 2>&1; then
-            EXISTING_ASSET=$(gh release view "v$VERSION" --json assets --jq --arg name "$VSIX" '.assets[] | select(.name == $name) | .name')
+            EXISTING_ASSET=$(gh release view "v$VERSION" --json assets | jq -r --arg name "$VSIX" '.assets[] | select(.name == $name) | .name')
             if [ -z "$EXISTING_ASSET" ]; then
               echo "GitHub Release 'v$VERSION' exists but is missing '$VSIX'; uploading asset..."
               gh release upload "v$VERSION" "$VSIX"
