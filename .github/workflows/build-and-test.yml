@@ -15,6 +15,10 @@ on:
      - cron: '0 6 * * 1' # 6am Monday
   workflow_dispatch:
   workflow_call:
+    inputs:
+      ref:
+        type: string
+        default: ''
 
 jobs:
 
@@ -82,6 +86,8 @@ jobs:
     steps:
 
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Delay on merge queue (to allow testing non-empty merge queue guard)
         if: github.event_name == 'merge_group'
@@ -119,6 +125,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Run Lychee Link Checker
         uses: lycheeverse/lychee-action@v2

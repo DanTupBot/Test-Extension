@@ -1,5 +1,13 @@
 name: Release
 
+# Publishes a single release (pre-release or stable) to the VS Code Marketplace,
+# tags the commit, and (for stable releases) creates a GitHub Release with the VSIX.
+#
+# Note: When publishing both a stable release (e.g. 3.148.0) and the first pre-release
+# for the next cycle (e.g. 3.149.YYYYMMDD), ensure the stable release is approved and
+# completes first so that package.json is bumped to 3.150.0-dev before the pre-release
+# run checks out the branch and auto-calculates its version.
+
 on:
   workflow_dispatch:
     inputs:
@@ -12,7 +20,7 @@ on:
           - stable
         default: pre-release
       version:
-        description: "Explicit version override (X.Y.Z). Leave blank to auto-calculate from package.json."
+        description: "Version to publish (X.Y.Z). Required for stable; leave blank for pre-release to auto-calculate."
         required: false
         type: string
         default: ""
@@ -29,253 +37,197 @@ on:
 
 permissions:
   contents: read
-  actions: read
-  checks: read
-
-concurrency:
-  group: release
-  cancel-in-progress: false
 
 jobs:
 
-  package:
+  release:
 
-    name: Package Extension
+    name: Release Extension
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    environment: release
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      id-token: write
+      actions: read
     outputs:
-      release_type: ${{ steps.version.outputs.release_type }}
-      base_dev_version: ${{ steps.version.outputs.base_dev_version }}
-      next_dev_version: ${{ steps.version.outputs.next_dev_version }}
-      primary_version: ${{ steps.version.outputs.primary_version }}
-      primary_vsix: ${{ steps.version.outputs.primary_vsix }}
-      companion_version: ${{ steps.version.outputs.companion_version }}
-      companion_vsix: ${{ steps.version.outputs.companion_vsix }}
-      pkg_name: ${{ steps.version.outputs.pkg_name }}
+      version: ${{ steps.prepare.outputs.version }}
 
     steps:
 
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
+          ref: ${{ github.ref_name }}
           fetch-depth: 0
           submodules: recursive
-
-      - name: Verify branch is default branch and matches remote HEAD
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          if [ "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]; then
-            echo "::error::Releases must be run from the default branch ($DEFAULT_BRANCH), not '$GITHUB_REF_NAME'."
-            exit 1
-          fi
-          REMOTE_SHA=$(git ls-remote origin "refs/heads/$DEFAULT_BRANCH" | awk '{print $1}')
-          if [ "$REMOTE_SHA" != "$GITHUB_SHA" ]; then
-            echo "::error::Remote $DEFAULT_BRANCH ($REMOTE_SHA) has moved ahead of workflow commit ($GITHUB_SHA)."
-            exit 1
-          fi
-
-      - name: Verify Merge Queue is empty
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO_OWNER: ${{ github.repository_owner }}
-          REPO_NAME: ${{ github.event.repository.name }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          QUEUE_JSON=$(gh api graphql -f query='
-            query($owner: String!, $name: String!, $branch: String!) {
-              repository(owner: $owner, name: $name) {
-                mergeQueue(branch: $branch) {
-                  entries(first: 20) {
-                    totalCount
-                    nodes {
-                      pullRequest {
-                        number
-                        title
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          ' -f owner="$REPO_OWNER" -f name="$REPO_NAME" -f branch="$DEFAULT_BRANCH")
-
-          TOTAL_COUNT=$(echo "$QUEUE_JSON" | jq -r '.data.repository.mergeQueue.entries.totalCount // 0')
-          if [ "$TOTAL_COUNT" -gt 0 ]; then
-            echo "::error::Merge queue on $DEFAULT_BRANCH is not empty ($TOTAL_COUNT PR(s) queued):"
-            echo "$QUEUE_JSON" | jq -r '.data.repository.mergeQueue.entries.nodes[].pullRequest | "  - #\(.number): \(.title)"'
-            exit 1
-          fi
-          echo "Merge queue on $DEFAULT_BRANCH is empty."
-
-      - name: Verify CI status on target commit
-        if: inputs.skip_ci_check != true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          CURRENT_SUITE_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq '.check_suite_id')
-          TARGET_SHA="$GITHUB_SHA"
-
-          # Fetch latest check runs for the target commit, excluding this Release workflow's check suite
-          # and any check runs from previous Release workflow attempts on the same commit.
-          get_filtered_checks() {
-            local sha="$1"
-            gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs" --paginate --slurp \
-              | jq --argjson suite_id "$CURRENT_SUITE_ID" '
-                  [
-                    .[].check_runs[]
-                    | select(
-                        .check_suite.id != $suite_id
-                        and .name != "Package Extension"
-                        and .name != "Publish Extension"
-                        and .name != "Post-Release Tests"
-                      )
-                  ]
-                  | group_by(.name)
-                  | map(max_by(.id))
-                '
-          }
-
-          CHECKS=$(get_filtered_checks "$TARGET_SHA")
-          COUNT=$(echo "$CHECKS" | jq 'length')
-
-          # If HEAD is a "Set version to X.Y.Z-dev" commit pushed by a previous automated release
-          # (which does not trigger on: push CI when pushed with GITHUB_TOKEN), walk back past any
-          # automated version-bump commits to verify the underlying code commit's CI status.
-          if [ "$COUNT" -eq 0 ]; then
-            COMMIT_SUBJECT=$(git log -1 --format=%s "$TARGET_SHA")
-            if [[ "$COMMIT_SUBJECT" =~ ^Set\ version\ to\ [0-9]+\.[0-9]+\.[0-9]+-dev$ ]]; then
-              CANDIDATE_SHA=$(git rev-parse "${TARGET_SHA}~1")
-              while [[ "$(git log -1 --format=%s "$CANDIDATE_SHA")" =~ ^(Publish\ v[0-9]+\.[0-9]+\.[0-9]+|Set\ version\ to\ [0-9]+\.[0-9]+\.[0-9]+-dev)$ ]]; do
-                CANDIDATE_SHA=$(git rev-parse "${CANDIDATE_SHA}~1")
-              done
-              echo "HEAD ($TARGET_SHA) is an automated version bump commit; checking underlying commit $CANDIDATE_SHA..."
-              TARGET_SHA="$CANDIDATE_SHA"
-              CHECKS=$(get_filtered_checks "$TARGET_SHA")
-              COUNT=$(echo "$CHECKS" | jq 'length')
-            fi
-          fi
-
-          if [ "$COUNT" -eq 0 ]; then
-            echo "::error::No CI check runs found on commit $TARGET_SHA."
-            exit 1
-          fi
-
-          MERGE_GUARD_OK=$(echo "$CHECKS" | jq '[.[] | select(.name == "Merge Guard" and .status == "completed" and .conclusion == "success")] | length')
-          if [ "$MERGE_GUARD_OK" -eq 0 ]; then
-            echo "::error::Required 'Merge Guard' check did not succeed on commit $TARGET_SHA."
-            echo "$CHECKS" | jq -r '.[] | "  - \(.name): status=\(.status), conclusion=\(.conclusion)"'
-            exit 1
-          fi
-
-          FAILED_CHECKS=$(echo "$CHECKS" | jq '[.[] | select(.status != "completed" or (.conclusion != "success" and .conclusion != "skipped"))]')
-          FAILED_COUNT=$(echo "$FAILED_CHECKS" | jq 'length')
-          if [ "$FAILED_COUNT" -gt 0 ]; then
-            echo "::error::$FAILED_COUNT CI check(s) on commit $TARGET_SHA did not succeed:"
-            echo "$FAILED_CHECKS" | jq -r '.[] | "  - \(.name): status=\(.status), conclusion=\(.conclusion)"'
-            exit 1
-          fi
-
-          echo "All $COUNT CI checks on $TARGET_SHA succeeded."
 
       - name: Set up Node v22
         uses: actions/setup-node@v7
         with:
           node-version: 22
 
-      - name: Compute and validate versions
-        id: version
+      - name: Prepare version and verify repository state
+        id: prepare
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           RELEASE_TYPE: ${{ inputs.release_type }}
           INPUT_VERSION: ${{ inputs.version }}
+          SKIP_CI_CHECK: ${{ inputs.skip_ci_check }}
         run: |
+          if [[ "$GITHUB_REF" != refs/heads/* ]]; then
+            echo "::error::Releases must be run from a branch (found '$GITHUB_REF')."
+            exit 1
+          fi
+
           PKG_NAME=$(node -p "require('./package.json').name")
-          BASE_DEV_VERSION=$(node -p "require('./package.json').version")
+          PKG_VERSION=$(node -p "require('./package.json').version")
 
-          if [[ ! "$BASE_DEV_VERSION" =~ ^([0-9]+)\.([0-9]+)\.0-dev$ ]]; then
-            echo "::error::Expected package.json version to match 'X.Y.0-dev', but found '$BASE_DEV_VERSION'."
-            exit 1
-          fi
-
-          BASE_MAJOR="${BASH_REMATCH[1]}"
-          BASE_MINOR="${BASH_REMATCH[2]}"
-          if [ $((BASE_MINOR % 2)) -ne 0 ]; then
-            echo "::error::Expected package.json minor version ($BASE_MINOR in $BASE_DEV_VERSION) to be an even number."
-            exit 1
-          fi
-
-          DATE_PATCH=$(date -u +%Y%m%d)
-          COMPANION_VERSION=""
-          COMPANION_VSIX=""
-
-          if [ -n "$INPUT_VERSION" ]; then
+          if [ "$RELEASE_TYPE" = "stable" ]; then
+            if [ -z "$INPUT_VERSION" ]; then
+              echo "::error::An explicit version (X.Y.Z) is required for stable releases."
+              exit 1
+            fi
             if [[ ! "$INPUT_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-              echo "::error::Explicit version '$INPUT_VERSION' must match 'X.Y.Z'."
+              echo "::error::Version '$INPUT_VERSION' must match 'X.Y.Z'."
               exit 1
             fi
-            INPUT_MINOR="${BASH_REMATCH[2]}"
-            if [ "$RELEASE_TYPE" = "pre-release" ] && [ $((INPUT_MINOR % 2)) -ne 1 ]; then
-              echo "::error::Pre-release version '$INPUT_VERSION' must have an odd minor version."
-              exit 1
-            fi
-            if [ "$RELEASE_TYPE" = "stable" ] && [ $((INPUT_MINOR % 2)) -ne 0 ]; then
+            MAJOR="${BASH_REMATCH[1]}"
+            MINOR="${BASH_REMATCH[2]}"
+            PATCH="${BASH_REMATCH[3]}"
+            if [ $((MINOR % 2)) -ne 0 ]; then
               echo "::error::Stable version '$INPUT_VERSION' must have an even minor version."
               exit 1
             fi
-            PRIMARY_VERSION="$INPUT_VERSION"
+            VERSION="$INPUT_VERSION"
           else
-            if [ "$RELEASE_TYPE" = "pre-release" ]; then
-              PRE_MINOR=$((BASE_MINOR - 1))
-              PRIMARY_VERSION="${BASE_MAJOR}.${PRE_MINOR}.${DATE_PATCH}"
+            if [ -n "$INPUT_VERSION" ]; then
+              if [[ ! "$INPUT_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+                echo "::error::Version '$INPUT_VERSION' must match 'X.Y.Z'."
+                exit 1
+              fi
+              MAJOR="${BASH_REMATCH[1]}"
+              MINOR="${BASH_REMATCH[2]}"
+              PATCH="${BASH_REMATCH[3]}"
+              if [ $((MINOR % 2)) -ne 1 ]; then
+                echo "::error::Pre-release version '$INPUT_VERSION' must have an odd minor version."
+                exit 1
+              fi
+              VERSION="$INPUT_VERSION"
             else
-              PRIMARY_VERSION="${BASE_MAJOR}.${BASE_MINOR}.0"
+              if [[ ! "$PKG_VERSION" =~ ^([0-9]+)\.([0-9]+)\.0-dev$ ]]; then
+                echo "::error::Expected package.json version to match 'X.Y.0-dev' to auto-calculate pre-release version, but found '$PKG_VERSION'."
+                exit 1
+              fi
+              BASE_MAJOR="${BASH_REMATCH[1]}"
+              BASE_MINOR="${BASH_REMATCH[2]}"
+              if [ $((BASE_MINOR % 2)) -ne 0 ]; then
+                echo "::error::Expected package.json minor version ($BASE_MINOR in $PKG_VERSION) to be an even number."
+                exit 1
+              fi
+              MAJOR="$BASE_MAJOR"
+              MINOR=$((BASE_MINOR - 1))
+              PATCH=$(date -u +%Y%m%d)
+              VERSION="${MAJOR}.${MINOR}.${PATCH}"
             fi
           fi
 
-          PRIMARY_VSIX="${PKG_NAME}-${PRIMARY_VERSION}.vsix"
+          VSIX="${PKG_NAME}-${VERSION}.vsix"
+          ALREADY_PUSHED="false"
+          NEXT_DEV_VERSION=""
 
-          if [ "$RELEASE_TYPE" = "pre-release" ]; then
-            NEXT_DEV_VERSION="$BASE_DEV_VERSION"
-          else
-            PRIMARY_MAJOR=$(echo "$PRIMARY_VERSION" | cut -d. -f1)
-            PRIMARY_MINOR=$(echo "$PRIMARY_VERSION" | cut -d. -f2)
-            COMPANION_MINOR=$((PRIMARY_MINOR + 1))
-            COMPANION_VERSION="${PRIMARY_MAJOR}.${COMPANION_MINOR}.${DATE_PATCH}"
-            COMPANION_VSIX="${PKG_NAME}-${COMPANION_VERSION}.vsix"
-
-            if [ "$PRIMARY_MINOR" -ge "$BASE_MINOR" ]; then
-              NEXT_DEV_MINOR=$((PRIMARY_MINOR + 2))
-              NEXT_DEV_VERSION="${PRIMARY_MAJOR}.${NEXT_DEV_MINOR}.0-dev"
+          # If tag v$VERSION already exists, only allow proceeding if this is a retry of a stable
+          # release whose tag is at HEAD (patch branch) or HEAD~1 (default branch after -dev bump).
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            TAG_SHA=$(git rev-parse "v$VERSION")
+            HEAD_SHA=$(git rev-parse HEAD)
+            PARENT_SHA=$(git rev-parse HEAD~1 2>/dev/null || true)
+            if [ "$RELEASE_TYPE" = "stable" ] && { [ "$TAG_SHA" = "$HEAD_SHA" ] || [ "$TAG_SHA" = "$PARENT_SHA" ]; }; then
+              echo "Tag 'v$VERSION' was already pushed ($TAG_SHA); checking out 'v$VERSION' to retry release steps."
+              git checkout "v$VERSION"
+              ALREADY_PUSHED="true"
             else
-              NEXT_DEV_VERSION="$BASE_DEV_VERSION"
+              echo "::error::Git tag 'v$VERSION' already exists."
+              exit 1
             fi
-          fi
+          else
+            # Validate version against current package.json on fresh runs.
+            if [ "$RELEASE_TYPE" = "stable" ]; then
+              if [ "$GITHUB_REF_NAME" = "$DEFAULT_BRANCH" ] && [ "$PATCH" -eq 0 ]; then
+                if [ "$PKG_VERSION" != "${MAJOR}.${MINOR}.0-dev" ]; then
+                  echo "::error::Stable version '$VERSION' does not match package.json version '$PKG_VERSION' on $DEFAULT_BRANCH."
+                  exit 1
+                fi
+                NEXT_DEV_VERSION="${MAJOR}.$((MINOR + 2)).0-dev"
+              else
+                if [[ "$PKG_VERSION" != "${MAJOR}.${MINOR}."* ]]; then
+                  echo "::error::Patch version '$VERSION' does not match major.minor of package.json version '$PKG_VERSION'."
+                  exit 1
+                fi
+                if [ "$GITHUB_REF_NAME" = "$DEFAULT_BRANCH" ] && [[ "$PKG_VERSION" == *-dev ]]; then
+                  NEXT_DEV_VERSION="$PKG_VERSION"
+                fi
+              fi
+            fi
 
-          if git rev-parse "v$PRIMARY_VERSION" >/dev/null 2>&1; then
-            echo "::error::Git tag 'v$PRIMARY_VERSION' already exists."
-            exit 1
-          fi
-          if [ -n "$COMPANION_VERSION" ] && git rev-parse "v$COMPANION_VERSION" >/dev/null 2>&1; then
-            echo "::error::Git tag 'v$COMPANION_VERSION' already exists."
-            exit 1
+            # Verify Merge Queue on target branch is empty.
+            QUEUE_JSON=$(gh api graphql -f query='
+              query($owner: String!, $name: String!, $branch: String!) {
+                repository(owner: $owner, name: $name) {
+                  mergeQueue(branch: $branch) {
+                    entries(first: 20) {
+                      totalCount
+                      nodes {
+                        pullRequest {
+                          number
+                          title
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            ' -f owner="$REPO_OWNER" -f name="$REPO_NAME" -f branch="$GITHUB_REF_NAME")
+
+            TOTAL_COUNT=$(echo "$QUEUE_JSON" | jq -r '.data.repository.mergeQueue.entries.totalCount // 0')
+            if [ "$TOTAL_COUNT" -gt 0 ]; then
+              echo "::error::Merge queue on $GITHUB_REF_NAME is not empty ($TOTAL_COUNT PR(s) queued):"
+              echo "$QUEUE_JSON" | jq -r '.data.repository.mergeQueue.entries.nodes[].pullRequest | "  - #\(.number): \(.title)"'
+              exit 1
+            fi
+
+            # Verify latest build-and-test.yml run on the target code commit succeeded.
+            if [ "$SKIP_CI_CHECK" != "true" ]; then
+              TARGET_SHA=$(git rev-parse HEAD)
+              while [[ "$(git log -1 --format=%s "$TARGET_SHA")" =~ ^(Publish\ v[0-9]+\.[0-9]+\.[0-9]+|Set\ version\ to\ [0-9]+\.[0-9]+\.[0-9]+-dev)$ ]]; do
+                TARGET_SHA=$(git rev-parse "${TARGET_SHA}~1")
+              done
+
+              CONCLUSION=$(gh run list --workflow=build-and-test.yml --commit="$TARGET_SHA" --json event,status,conclusion \
+                --jq '[.[] | select(.event != "merge_group")][0] | select(.status == "completed") | .conclusion')
+              if [ "$CONCLUSION" != "success" ]; then
+                echo "::error::Latest 'Run Tests' (build-and-test.yml) run on commit $TARGET_SHA did not succeed (conclusion: ${CONCLUSION:-none/in-progress})."
+                exit 1
+              fi
+              echo "Verified 'Run Tests' succeeded on commit $TARGET_SHA."
+            fi
           fi
 
           {
-            echo "release_type=$RELEASE_TYPE"
-            echo "base_dev_version=$BASE_DEV_VERSION"
-            echo "next_dev_version=$NEXT_DEV_VERSION"
-            echo "primary_version=$PRIMARY_VERSION"
-            echo "primary_vsix=$PRIMARY_VSIX"
-            echo "companion_version=$COMPANION_VERSION"
-            echo "companion_vsix=$COMPANION_VSIX"
+            echo "version=$VERSION"
+            echo "vsix=$VSIX"
             echo "pkg_name=$PKG_NAME"
+            echo "next_dev_version=$NEXT_DEV_VERSION"
+            echo "already_pushed=$ALREADY_PUSHED"
           } >> "$GITHUB_OUTPUT"
 
-          echo "Computed primary version: $PRIMARY_VERSION ($PRIMARY_VSIX)"
-          if [ -n "$COMPANION_VERSION" ]; then
-            echo "Computed companion pre-release version: $COMPANION_VERSION ($COMPANION_VSIX)"
-          fi
-          echo "Next -dev version: $NEXT_DEV_VERSION"
+          echo "Prepared $RELEASE_TYPE v$VERSION ($VSIX)"
 
       - name: npm ci
         run: npm ci
@@ -283,235 +235,93 @@ jobs:
       - name: npm run lint
         run: npm run lint
 
-      - name: Package extension (.vsix)
+      - name: Package and publish extension (.vsix)
         env:
-          RELEASE_TYPE: ${{ steps.version.outputs.release_type }}
-          PRIMARY_VERSION: ${{ steps.version.outputs.primary_version }}
-          PRIMARY_VSIX: ${{ steps.version.outputs.primary_vsix }}
-          COMPANION_VERSION: ${{ steps.version.outputs.companion_version }}
-          COMPANION_VSIX: ${{ steps.version.outputs.companion_vsix }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          VERSION: ${{ steps.prepare.outputs.version }}
+          VSIX: ${{ steps.prepare.outputs.vsix }}
         run: |
-          npm version "$PRIMARY_VERSION" --no-git-tag-version
+          PRE_FLAG=""
           if [ "$RELEASE_TYPE" = "pre-release" ]; then
-            npx vsce package --pre-release -o "$PRIMARY_VSIX"
-          else
-            npx vsce package -o "$PRIMARY_VSIX"
+            PRE_FLAG="--pre-release"
           fi
 
-          if [ -n "$COMPANION_VERSION" ]; then
-            npm version "$COMPANION_VERSION" --no-git-tag-version
-            npx vsce package --pre-release -o "$COMPANION_VSIX"
-          fi
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          npx vsce package $PRE_FLAG -o "$VSIX"
 
-      - name: Upload VSIX artifact(s)
-        uses: actions/upload-artifact@v7
-        with:
-          name: release-vsix
-          path: "*.vsix"
-          if-no-files-found: error
-
-      - name: Write job summary
-        env:
-          RELEASE_TYPE: ${{ steps.version.outputs.release_type }}
-          PRIMARY_VERSION: ${{ steps.version.outputs.primary_version }}
-          PRIMARY_VSIX: ${{ steps.version.outputs.primary_vsix }}
-          COMPANION_VERSION: ${{ steps.version.outputs.companion_version }}
-          COMPANION_VSIX: ${{ steps.version.outputs.companion_vsix }}
-          NEXT_DEV_VERSION: ${{ steps.version.outputs.next_dev_version }}
-          DRY_RUN: ${{ inputs.dry_run }}
-        run: |
-          {
-            echo "### Release Package Summary"
-            echo "- **Release Type:** \`$RELEASE_TYPE\`"
-            echo "- **Dry Run (Skip Marketplace Publish):** \`$DRY_RUN\`"
-            echo "- **Primary Version:** \`v$PRIMARY_VERSION\` (\`$PRIMARY_VSIX\`)"
-            if [ -n "$COMPANION_VERSION" ]; then
-              echo "- **Companion Pre-Release:** \`v$COMPANION_VERSION\` (\`$COMPANION_VSIX\`)"
-            fi
-            echo "- **Post-Release \`package.json\` Version:** \`$NEXT_DEV_VERSION\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  publish:
-
-    name: Publish Extension
-    needs: package
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    environment: release
-    permissions:
-      contents: write
-      id-token: write
-
-    steps:
-
-      - name: Checkout repository
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Verify branch and Merge Queue before publishing
-        id: check_state
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO_OWNER: ${{ github.repository_owner }}
-          REPO_NAME: ${{ github.event.repository.name }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          PRIMARY_VERSION: ${{ needs.package.outputs.primary_version }}
-          COMPANION_VERSION: ${{ needs.package.outputs.companion_version }}
-        run: |
-          if [ -n "$(git ls-remote origin "refs/tags/v$PRIMARY_VERSION")" ]; then
-            git fetch origin "refs/tags/v$PRIMARY_VERSION:refs/tags/v$PRIMARY_VERSION"
-            TAG_PARENT_SHA=$(git rev-parse "v${PRIMARY_VERSION}~1" 2>/dev/null || true)
-            if [ "$TAG_PARENT_SHA" = "$GITHUB_SHA" ]; then
-              echo "Tag 'v$PRIMARY_VERSION' was already pushed from $GITHUB_SHA in a previous attempt; skipping git push."
-              echo "already_pushed=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            echo "::error::Tag 'v$PRIMARY_VERSION' already exists on origin (parent $TAG_PARENT_SHA != $GITHUB_SHA)."
-            exit 1
-          fi
-
-          REMOTE_SHA=$(git ls-remote origin "refs/heads/$DEFAULT_BRANCH" | awk '{print $1}')
-          if [ "$REMOTE_SHA" != "$GITHUB_SHA" ]; then
-            echo "::error::Remote $DEFAULT_BRANCH ($REMOTE_SHA) has moved since packaging ($GITHUB_SHA). Aborting publish."
-            exit 1
-          fi
-
-          if [ -n "$COMPANION_VERSION" ] && [ -n "$(git ls-remote origin "refs/tags/v$COMPANION_VERSION")" ]; then
-            echo "::error::Tag 'v$COMPANION_VERSION' already exists on origin."
-            exit 1
-          fi
-
-          QUEUE_JSON=$(gh api graphql -f query='
-            query($owner: String!, $name: String!, $branch: String!) {
-              repository(owner: $owner, name: $name) {
-                mergeQueue(branch: $branch) {
-                  entries(first: 20) {
-                    totalCount
-                    nodes {
-                      pullRequest {
-                        number
-                        title
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          ' -f owner="$REPO_OWNER" -f name="$REPO_NAME" -f branch="$DEFAULT_BRANCH")
-
-          TOTAL_COUNT=$(echo "$QUEUE_JSON" | jq -r '.data.repository.mergeQueue.entries.totalCount // 0')
-          if [ "$TOTAL_COUNT" -gt 0 ]; then
-            echo "::error::Merge queue on $DEFAULT_BRANCH is not empty ($TOTAL_COUNT PR(s) queued)."
-            exit 1
-          fi
-
-          echo "already_pushed=false" >> "$GITHUB_OUTPUT"
-
-      - name: Set up Node v22
-        uses: actions/setup-node@v7
-        with:
-          node-version: 22
-
-      - name: Install dependencies (for locked @vscode/vsce)
-        run: npm ci --ignore-scripts
-
-      - name: Download VSIX artifact(s)
-        uses: actions/download-artifact@v8
-        with:
-          name: release-vsix
-
-      - name: Publish to VS Code Marketplace via Trusted Publishing
-        env:
-          DRY_RUN: ${{ inputs.dry_run }}
-          RELEASE_TYPE: ${{ needs.package.outputs.release_type }}
-          PRIMARY_VSIX: ${{ needs.package.outputs.primary_vsix }}
-          COMPANION_VSIX: ${{ needs.package.outputs.companion_vsix }}
-        run: |
           if [ "$DRY_RUN" = "true" ]; then
             if [ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
               echo "::error::OIDC token environment variables are missing (check id-token: write permission)."
               exit 1
             fi
-            if [ "$RELEASE_TYPE" = "pre-release" ]; then
-              echo "[Dry Run] Would execute: npx vsce publish --oidc --skip-duplicate --pre-release --packagePath $PRIMARY_VSIX"
-            else
-              echo "[Dry Run] Would execute: npx vsce publish --oidc --skip-duplicate --packagePath $PRIMARY_VSIX"
-              echo "[Dry Run] Would execute: npx vsce publish --oidc --skip-duplicate --pre-release --packagePath $COMPANION_VSIX"
-            fi
+            echo "[Dry Run] Would execute: npx vsce publish --oidc --skip-duplicate $PRE_FLAG --packagePath $VSIX"
           else
-            if [ "$RELEASE_TYPE" = "pre-release" ]; then
-              npx vsce publish --oidc --skip-duplicate --pre-release --packagePath "$PRIMARY_VSIX"
-            else
-              npx vsce publish --oidc --skip-duplicate --packagePath "$PRIMARY_VSIX"
-              npx vsce publish --oidc --skip-duplicate --pre-release --packagePath "$COMPANION_VSIX"
-            fi
+            npx vsce publish --oidc --skip-duplicate $PRE_FLAG --packagePath "$VSIX"
           fi
 
-      - name: Commit, Tag, and Push to default branch
-        if: steps.check_state.outputs.already_pushed != 'true'
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.prepare.outputs.vsix }}
+          path: ${{ steps.prepare.outputs.vsix }}
+          if-no-files-found: error
+
+      - name: Commit, Tag, and Push
+        if: steps.prepare.outputs.already_pushed != 'true'
         env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          PRIMARY_VERSION: ${{ needs.package.outputs.primary_version }}
-          COMPANION_VERSION: ${{ needs.package.outputs.companion_version }}
-          NEXT_DEV_VERSION: ${{ needs.package.outputs.next_dev_version }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          VERSION: ${{ steps.prepare.outputs.version }}
+          NEXT_DEV_VERSION: ${{ steps.prepare.outputs.next_dev_version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          npm version "$PRIMARY_VERSION" --no-git-tag-version
-          git commit -am "Publish v$PRIMARY_VERSION"
-          git tag "v$PRIMARY_VERSION"
+          git commit -am "Publish v$VERSION"
+          git tag "v$VERSION"
 
-          if [ -n "$COMPANION_VERSION" ]; then
-            npm version "$COMPANION_VERSION" --no-git-tag-version
-            git commit -am "Publish v$COMPANION_VERSION"
-            git tag "v$COMPANION_VERSION"
-          fi
-
-          npm version "$NEXT_DEV_VERSION" --no-git-tag-version
-          git commit -am "Set version to $NEXT_DEV_VERSION"
-
-          if [ -n "$COMPANION_VERSION" ]; then
-            git push --atomic origin "HEAD:$DEFAULT_BRANCH" "refs/tags/v$PRIMARY_VERSION" "refs/tags/v$COMPANION_VERSION"
+          if [ "$RELEASE_TYPE" = "pre-release" ]; then
+            git push origin "refs/tags/v$VERSION"
           else
-            git push --atomic origin "HEAD:$DEFAULT_BRANCH" "refs/tags/v$PRIMARY_VERSION"
+            if [ -n "$NEXT_DEV_VERSION" ]; then
+              npm version "$NEXT_DEV_VERSION" --no-git-tag-version
+              git commit -am "Set version to $NEXT_DEV_VERSION"
+            fi
+            git push --atomic origin "HEAD:$GITHUB_REF_NAME" "refs/tags/v$VERSION"
           fi
 
       - name: Create GitHub Release (stable only)
-        if: needs.package.outputs.release_type == 'stable'
+        if: inputs.release_type == 'stable'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PRIMARY_VERSION: ${{ needs.package.outputs.primary_version }}
-          PRIMARY_VSIX: ${{ needs.package.outputs.primary_vsix }}
-          PKG_NAME: ${{ needs.package.outputs.pkg_name }}
+          VERSION: ${{ steps.prepare.outputs.version }}
+          VSIX: ${{ steps.prepare.outputs.vsix }}
+          PKG_NAME: ${{ steps.prepare.outputs.pkg_name }}
         run: |
-          if gh release view "v$PRIMARY_VERSION" >/dev/null 2>&1; then
-            EXISTING_ASSET=$(gh release view "v$PRIMARY_VERSION" --json assets --jq --arg name "$PRIMARY_VSIX" '.assets[] | select(.name == $name) | .name')
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            EXISTING_ASSET=$(gh release view "v$VERSION" --json assets --jq --arg name "$VSIX" '.assets[] | select(.name == $name) | .name')
             if [ -z "$EXISTING_ASSET" ]; then
-              echo "GitHub Release 'v$PRIMARY_VERSION' exists but is missing '$PRIMARY_VSIX'; uploading asset..."
-              gh release upload "v$PRIMARY_VERSION" "$PRIMARY_VSIX"
+              echo "GitHub Release 'v$VERSION' exists but is missing '$VSIX'; uploading asset..."
+              gh release upload "v$VERSION" "$VSIX"
             else
-              echo "GitHub Release 'v$PRIMARY_VERSION' and asset '$PRIMARY_VSIX' already exist."
+              echo "GitHub Release 'v$VERSION' and asset '$VSIX' already exist."
             fi
             exit 0
           fi
 
-          MAJOR_MINOR=$(echo "$PRIMARY_VERSION" | cut -d. -f1,2 | tr '.' '-')
+          MAJOR_MINOR=$(echo "$VERSION" | cut -d. -f1,2 | tr '.' '-')
           if [ "$PKG_NAME" = "dart-code" ]; then
-            RELEASE_TITLE="Dart Code v$PRIMARY_VERSION"
+            RELEASE_TITLE="Dart Code v$VERSION"
             INSTALL_TEXT="Dart Code"
           elif [ "$PKG_NAME" = "flutter" ]; then
-            RELEASE_TITLE="v$PRIMARY_VERSION"
+            RELEASE_TITLE="v$VERSION"
             INSTALL_TEXT="The Flutter extension"
           else
-            RELEASE_TITLE="v$PRIMARY_VERSION"
+            RELEASE_TITLE="v$VERSION"
             INSTALL_TEXT="The $PKG_NAME extension"
           fi
 
-          gh release create "v$PRIMARY_VERSION" "$PRIMARY_VSIX" \
-            --title "$RELEASE_TITLE" \
-            --notes-file - <<EOF
+          sed 's/^          //' <<EOF | gh release create "v$VERSION" "$VSIX" --title "$RELEASE_TITLE" --notes-file -
           ## Installation
 
           $INSTALL_TEXT can be [installed from the Visual Studio Code Marketplace](https://marketplace.visualstudio.com/items?itemName=Dart-Code.$PKG_NAME).
@@ -522,6 +332,8 @@ jobs:
   post_release_tests:
 
     name: Post-Release Tests
-    needs: [package, publish]
-    if: needs.package.outputs.release_type == 'stable'
+    needs: release
+    if: inputs.release_type == 'stable'
     uses: ./.github/workflows/build-and-test.yml
+    with:
+      ref: v${{ needs.release.outputs.version }}
