@@ -21,6 +21,11 @@ on:
         required: false
         type: boolean
         default: false
+      dry_run:
+        description: "Dry run (skip publishing to VS Code Marketplace, but still commit/tag/release)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -129,7 +134,7 @@ jobs:
           if [ "$COUNT" -eq 0 ]; then
             COMMIT_SUBJECT=$(git log -1 --format=%s "$TARGET_SHA")
             if [[ "$COMMIT_SUBJECT" =~ ^Set\ version\ to\ [0-9]+\.[0-9]+\.[0-9]+-dev$ ]]; then
-               CANDIDATE_SHA=$(git rev-parse "${TARGET_SHA}~1")
+              CANDIDATE_SHA=$(git rev-parse "${TARGET_SHA}~1")
               while [[ "$(git log -1 --format=%s "$CANDIDATE_SHA")" =~ ^Publish\ v[0-9]+\.[0-9]+\.[0-9]+$ ]]; do
                 CANDIDATE_SHA=$(git rev-parse "${CANDIDATE_SHA}~1")
               done
@@ -302,10 +307,12 @@ jobs:
           COMPANION_VERSION: ${{ steps.version.outputs.companion_version }}
           COMPANION_VSIX: ${{ steps.version.outputs.companion_vsix }}
           NEXT_DEV_VERSION: ${{ steps.version.outputs.next_dev_version }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           {
             echo "### Release Package Summary"
             echo "- **Release Type:** \`$RELEASE_TYPE\`"
+            echo "- **Dry Run (Skip Marketplace Publish):** \`$DRY_RUN\`"
             echo "- **Primary Version:** \`v$PRIMARY_VERSION\` (\`$PRIMARY_VSIX\`)"
             if [ -n "$COMPANION_VERSION" ]; then
               echo "- **Companion Pre-Release:** \`v$COMPANION_VERSION\` (\`$COMPANION_VSIX\`)"
@@ -394,15 +401,29 @@ jobs:
 
       - name: Publish to VS Code Marketplace via Trusted Publishing
         env:
+          DRY_RUN: ${{ inputs.dry_run }}
           RELEASE_TYPE: ${{ needs.package.outputs.release_type }}
           PRIMARY_VSIX: ${{ needs.package.outputs.primary_vsix }}
           COMPANION_VSIX: ${{ needs.package.outputs.companion_vsix }}
         run: |
-          if [ "$RELEASE_TYPE" = "pre-release" ]; then
-            npx vsce publish --oidc --pre-release --packagePath "$PRIMARY_VSIX"
+          if [ "$DRY_RUN" = "true" ]; then
+            if [ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+              echo "::error::OIDC token environment variables are missing (check id-token: write permission)."
+              exit 1
+            fi
+            if [ "$RELEASE_TYPE" = "pre-release" ]; then
+              echo "[Dry Run] Would execute: npx vsce publish --oidc --pre-release --packagePath $PRIMARY_VSIX"
+            else
+              echo "[Dry Run] Would execute: npx vsce publish --oidc --packagePath $PRIMARY_VSIX"
+              echo "[Dry Run] Would execute: npx vsce publish --oidc --pre-release --packagePath $COMPANION_VSIX"
+            fi
           else
-            npx vsce publish --oidc --packagePath "$PRIMARY_VSIX"
-            npx vsce publish --oidc --pre-release --packagePath "$COMPANION_VSIX"
+            if [ "$RELEASE_TYPE" = "pre-release" ]; then
+              npx vsce publish --oidc --pre-release --packagePath "$PRIMARY_VSIX"
+            else
+              npx vsce publish --oidc --packagePath "$PRIMARY_VSIX"
+              npx vsce publish --oidc --pre-release --packagePath "$COMPANION_VSIX"
+            fi
           fi
 
       - name: Commit, Tag, and Push to default branch

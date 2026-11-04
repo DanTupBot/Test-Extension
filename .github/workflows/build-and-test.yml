@@ -18,6 +18,7 @@ on:
 
 jobs:
 
+
   build_exclusions:
 
     permissions:
@@ -27,29 +28,43 @@ jobs:
     outputs:
       excludes: ${{ join(steps.*.outputs.excludes) }}
       run_tests: ${{ github.event_name != 'merge_group' }}
+      check_links: ${{ github.event_name != 'merge_group' }}
     steps:
       - id: no_exclude
         name: Run all builds
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || startsWith(github.ref, 'refs/tags/')
+        # On scheduled runs, manual workflow dispatches, and tag pushes, run the full matrix across
+        # all OSes and SDK channels.
         run: echo 'excludes=[]' >> $GITHUB_OUTPUT
       - id: exclude_master
-        name: Exclude beta and non-Linux builds on main/master
+        name: Exclude beta and non-Linux builds on master
         if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
+        # On pushes to master (which occur once per combined batch from the merge queue), run all
+        # bots on Linux stable, excluding only:
+        # - all betas
+        # - Windows
+        # - macOS
         run: echo 'excludes=[{"build-version":"beta"},{"os":"windows-latest"},{"os":"macos-latest"}]' >> $GITHUB_OUTPUT
       - id: exclude_pr
         name: Exclude beta, non-Linux, and secondary bots on PRs
         if: github.event_name == 'pull_request'
+        # To speed up CI on every PR, in addition to excluding beta, Windows, and macOS, we also
+        # exclude secondary/slower bots.
         run: echo 'excludes=[{"build-version":"beta"},{"os":"windows-latest"},{"os":"macos-latest"}]' >> $GITHUB_OUTPUT
       - id: exclude_merge_group
         name: Exclude all builds except misc if running on merge queue
         if: github.event_name == 'merge_group'
+        # GitHub's merge queue dispatches a merge_group event for every individual PR in the queue,
+        # only batching the final push to master. Exclude everything except misc (stable,
+        # ubuntu-latest), which will just run lint/build/grammar tests, and let the full Linux
+        # stable suite run once on the combined push to master.
         run: echo 'excludes=[{"build-version":"beta"},{"os":"windows-latest"},{"os":"macos-latest"},{"bot":"dart"}]' >> $GITHUB_OUTPUT
 
   build:
 
     name: "${{ matrix.bot }} (${{ matrix.build-version }} ${{ matrix.os }})"
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 45
     needs: build_exclusions
 
     strategy:
@@ -91,6 +106,32 @@ jobs:
         if: env.RUN_TESTS == 'true'
         run: npm test
 
+  link_check:
+    name: Check Links (Lychee)
+    needs: build_exclusions
+    if: needs.build_exclusions.outputs.check_links == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Run Lychee Link Checker
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: >
+            --root-dir ./
+            --exclude-all-private
+            --exclude '\$\%7B[^}]+\%7D'
+            --exclude "^file://"
+            ./src/**/*.ts
+            ./*.md
+            package.json
+
   # A single action based on the test outcome that can be used
   # as a required status check.
   merge-guard:
@@ -115,11 +156,14 @@ jobs:
       contents: none
     name: Notify Discord of Failure
     needs: build
-    if: failure() && (github.event_name == 'push' || github.event_name == 'merge_group' || github.event_name == 'schedule')
+    if: failure() && (github.event_name == 'push' || github.event_name == 'merge_group' || github.event_name == 'schedule') && (github.ref == 'refs/heads/master' || github.event.merge_group.base_ref == 'refs/heads/master') && github.repository == 'Dart-Code/Dart-Code'
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
     steps:
 
-      - name: Log failure
-        run: echo "Build failed on $GITHUB_REF ($GITHUB_SHA)"
+      - name: Send notification to Discord
+        run: 'Invoke-WebRequest -Headers @{ "Content-Type" = "application/json" } -Method Post -Body "{`"content`":`"Build failed on $($env:GITHUB_REF.Replace(`"refs/heads/`", `"`")): https://github.com/Dart-Code/Dart-Code/commit/$($env:GITHUB_SHA)/checks`"}" -Uri $env:DISCORD_WEBHOOK'
+        shell: pwsh
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
