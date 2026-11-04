@@ -86,15 +86,6 @@ jobs:
             exit 1
           fi
 
-          # Ensure no non-release commits landed on the branch since the workflow was triggered.
-          if [ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]; then
-            NON_RELEASE_COMMITS=$(git log --format=%s "${GITHUB_SHA}..HEAD" | grep -vE '^(Publish v[0-9]+\.[0-9]+\.[0-9]+|Set version to [0-9]+\.[0-9]+\.[0-9]+-dev)$' || true)
-            if [ -n "$NON_RELEASE_COMMITS" ]; then
-              echo "::error::Branch $GITHUB_REF_NAME has new commits since workflow was triggered ($GITHUB_SHA)."
-              exit 1
-            fi
-          fi
-
           PKG_NAME=$(node -p "require('./package.json').name")
           PKG_VERSION=$(node -p "require('./package.json').version")
 
@@ -135,19 +126,19 @@ jobs:
           ALREADY_PUSHED="false"
           NEXT_DEV_VERSION=""
 
-          # If tag v$VERSION already exists, only allow proceeding if this is a retry of a stable
-          # release whose tag is at HEAD (patch branch) or HEAD~1 (default branch after -dev bump).
+          # If tag v$VERSION already exists, only allow proceeding if this is a stable release
+          # retry where the GitHub Release (or its VSIX asset) has not been completed yet.
           if git rev-parse "v$VERSION^{commit}" >/dev/null 2>&1; then
-            TAG_SHA=$(git rev-parse "v$VERSION^{commit}")
-            HEAD_SHA=$(git rev-parse HEAD)
-            PARENT_SHA=$(git rev-parse HEAD~1 2>/dev/null || true)
-            HEAD_SUBJECT=$(git log -1 --format=%s HEAD)
-            if [ "$RELEASE_TYPE" = "stable" ] && { [ "$TAG_SHA" = "$HEAD_SHA" ] || { [ "$TAG_SHA" = "$PARENT_SHA" ] && [[ "$HEAD_SUBJECT" =~ ^Set\ version\ to\ [0-9]+\.[0-9]+\.[0-9]+-dev$ ]]; }; }; then
-              echo "Tag 'v$VERSION' was already pushed ($TAG_SHA); checking out 'v$VERSION' to retry release steps."
+            EXISTING_ASSET=""
+            if [ "$RELEASE_TYPE" = "stable" ] && gh release view "v$VERSION" >/dev/null 2>&1; then
+              EXISTING_ASSET=$(gh release view "v$VERSION" --json assets | jq -r --arg name "$VSIX" '.assets[] | select(.name == $name) | .name')
+            fi
+            if [ "$RELEASE_TYPE" = "stable" ] && [ -z "$EXISTING_ASSET" ]; then
+              echo "Tag 'v$VERSION' was already pushed but GitHub Release is incomplete; checking out 'v$VERSION' to retry."
               git checkout --recurse-submodules "v$VERSION"
               ALREADY_PUSHED="true"
             else
-              echo "::error::Git tag 'v$VERSION' already exists."
+              echo "::error::Release 'v$VERSION' has already been published."
               exit 1
             fi
           else
@@ -197,20 +188,32 @@ jobs:
               exit 1
             fi
 
-            # Verify latest build-and-test.yml run on the target code commit succeeded.
+            # Verify latest build-and-test.yml run on the latest non-bot commit succeeded.
             if [ "$SKIP_CI_CHECK" != "true" ]; then
-              TARGET_SHA=$(git rev-parse HEAD)
-              while [[ "$(git log -1 --format=%s "$TARGET_SHA")" =~ ^(Publish\ v[0-9]+\.[0-9]+\.[0-9]+|Set\ version\ to\ [0-9]+\.[0-9]+\.[0-9]+-dev)$ ]]; do
-                TARGET_SHA=$(git rev-parse "${TARGET_SHA}~1")
-              done
+              TARGET_SHA=$(git log -n 1 --invert-grep --author="github-actions\[bot\]" --format=%H HEAD)
+              RUN_JSON=$(gh run list --workflow=build-and-test.yml --commit="$TARGET_SHA" --json event,status,conclusion,url \
+                --jq '[.[] | select(.event != "merge_group")][0]')
 
-              CONCLUSION=$(gh run list --workflow=build-and-test.yml --commit="$TARGET_SHA" --json event,status,conclusion \
-                --jq '[.[] | select(.event != "merge_group")][0] | select(.status == "completed") | .conclusion')
-              if [ "$CONCLUSION" != "success" ]; then
-                echo "::error::Latest 'Run Tests' (build-and-test.yml) run on commit $TARGET_SHA did not succeed (conclusion: ${CONCLUSION:-none/in-progress})."
+              if [ -z "$RUN_JSON" ] || [ "$RUN_JSON" = "null" ]; then
+                echo "::error::No 'Run Tests' (build-and-test.yml) run found for commit $TARGET_SHA. Wait for CI to start and finish, or re-run the Release workflow with 'skip_ci_check' enabled to override."
                 exit 1
               fi
-              echo "Verified 'Run Tests' succeeded on commit $TARGET_SHA."
+
+              RUN_STATUS=$(echo "$RUN_JSON" | jq -r '.status')
+              RUN_CONCLUSION=$(echo "$RUN_JSON" | jq -r '.conclusion')
+              RUN_URL=$(echo "$RUN_JSON" | jq -r '.url')
+
+              if [ "$RUN_STATUS" != "completed" ]; then
+                echo "::error::'Run Tests' on commit $TARGET_SHA is still in progress (status: $RUN_STATUS, $RUN_URL). Wait for it to complete and click 'Re-run failed jobs' on this release, or trigger a new Release run with 'skip_ci_check' enabled to override."
+                exit 1
+              fi
+
+              if [ "$RUN_CONCLUSION" != "success" ]; then
+                echo "::error::'Run Tests' on commit $TARGET_SHA did not pass (conclusion: $RUN_CONCLUSION, $RUN_URL). Fix or re-run the failed CI jobs, or trigger a new Release run with 'skip_ci_check' enabled to override."
+                exit 1
+              fi
+
+              echo "Verified 'Run Tests' succeeded on commit $TARGET_SHA ($RUN_URL)."
             fi
           fi
 

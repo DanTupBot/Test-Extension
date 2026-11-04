@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - master
+      - 'patch-*'
     tags:
       - '**'
   pull_request:
