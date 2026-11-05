@@ -46,9 +46,7 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: write
-      actions: read
-    outputs:
-      version: ${{ steps.version.outputs.version }}
+      actions: write
 
     steps:
 
@@ -70,25 +68,33 @@ jobs:
           RELEASE_TYPE: ${{ inputs.release_type }}
           INPUT_VERSION: ${{ inputs.version }}
         run: |
+          # Versioning convention:
+          # - Stable releases always use EVEN minor versions (e.g. 3.148.0, or patch 3.146.1).
+          # - Pre-releases always use ODD minor versions with the UTC date as patch (e.g. 3.147.20261105),
+          #   because the VS Code Marketplace does not support semver pre-release suffixes like '-dev'.
+          # - Between releases, package.json on the default branch sits at the next EVEN minor version
+          #   with a '-dev' suffix (e.g. 3.148.0-dev).
           PKG_NAME=$(node -p "require('./package.json').name")
           PKG_VERSION=$(node -p "require('./package.json').version")
 
           if [ -z "$INPUT_VERSION" ]; then
             if [ "$RELEASE_TYPE" = "stable" ]; then
-              echo "::error::An explicit version (X.Y.Z) is required for stable releases."
+              echo "::error::An explicit version (X.Y.Z) is required for stable releases. Re-run the workflow and provide the target version (e.g. 3.148.0)."
               exit 1
             fi
             if [[ ! "$PKG_VERSION" =~ ^([0-9]+)\.([0-9]+)\.0-dev$ ]]; then
-              echo "::error::Expected package.json version to match 'X.Y.0-dev', but found '$PKG_VERSION'."
+              echo "::error::Cannot auto-calculate pre-release version because package.json version is '$PKG_VERSION' (expected 'X.Y.0-dev'). Update package.json or provide an explicit version input."
               exit 1
             fi
+            # Subtract 1 from the even '-dev' minor version in package.json to get the odd pre-release
+            # minor version, and use today's UTC date (YYYYMMDD) as the patch number.
             VERSION="${BASH_REMATCH[1]}.$(( ${BASH_REMATCH[2]} - 1 )).$(date -u +%Y%m%d)"
           else
             VERSION="$INPUT_VERSION"
           fi
 
           if [[ ! "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-            echo "::error::Version '$VERSION' must match 'X.Y.Z'."
+            echo "::error::Version '$VERSION' must match 'X.Y.Z' (three numeric components, e.g. 3.148.0)."
             exit 1
           fi
           MAJOR="${BASH_REMATCH[1]}"
@@ -96,19 +102,21 @@ jobs:
           PATCH="${BASH_REMATCH[3]}"
 
           if [ "$RELEASE_TYPE" = "stable" ] && [ $((MINOR % 2)) -ne 0 ]; then
-            echo "::error::Stable version '$VERSION' must have an even minor version."
+            echo "::error::Stable version '$VERSION' must have an EVEN minor version (found $MINOR). Check the version number or switch 'release_type' to 'pre-release'."
             exit 1
           fi
           if [ "$RELEASE_TYPE" = "pre-release" ] && [ $((MINOR % 2)) -ne 1 ]; then
-            echo "::error::Pre-release version '$VERSION' must have an odd minor version."
+            echo "::error::Pre-release version '$VERSION' must have an ODD minor version (found $MINOR). Check the version number or switch 'release_type' to 'stable'."
             exit 1
           fi
 
           if git rev-parse "v$VERSION" >/dev/null 2>&1; then
-            echo "::error::Git tag 'v$VERSION' already exists."
+            echo "::error::Git tag 'v$VERSION' already exists. Check that the version number is correct, or if you are retrying a failed release, delete the existing 'v$VERSION' tag (and any partial GitHub Release) before re-running."
             exit 1
           fi
 
+          # After a '.0' stable minor release (e.g. 3.148.0), advance package.json to the next even
+          # minor '-dev' version (Y + 2, e.g. 3.150.0-dev). Patch releases (PATCH > 0) do not advance '-dev'.
           NEXT_DEV_VERSION=""
           if [ "$RELEASE_TYPE" = "stable" ] && [ "$PATCH" -eq 0 ]; then
             NEXT_DEV_VERSION="${MAJOR}.$((MINOR + 2)).0-dev"
@@ -134,7 +142,7 @@ jobs:
             -f o="$REPO_OWNER" -f r="$REPO_NAME" -f b="$GITHUB_REF_NAME" \
             --jq '.data.repository.mergeQueue.entries.totalCount // 0')
           if [ "$TOTAL_COUNT" -gt 0 ]; then
-            echo "::error::Merge queue on $GITHUB_REF_NAME is not empty ($TOTAL_COUNT PR(s) queued)."
+            echo "::error::Merge queue on '$GITHUB_REF_NAME' is not empty ($TOTAL_COUNT PR(s) currently queued). Wait for queued PRs to finish merging or remove them from the queue before releasing."
             exit 1
           fi
 
@@ -184,9 +192,9 @@ jobs:
         run: |
           npm version "$VERSION" --no-git-tag-version
           if [ "$RELEASE_TYPE" = "pre-release" ]; then
-            npx vsce package --pre-release -o "$VSIX"
+            npx @vscode/vsce package --pre-release -o "$VSIX"
           else
-            npx vsce package -o "$VSIX"
+            npx @vscode/vsce package -o "$VSIX"
           fi
 
       - name: Upload VSIX artifact
@@ -203,6 +211,8 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           NEXT_DEV_VERSION: ${{ steps.version.outputs.next_dev_version }}
         run: |
+          # Use the standard GitHub Actions bot identity (user ID 41898282) so commits are
+          # attributed to github-actions[bot] on GitHub.
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
@@ -247,11 +257,11 @@ jobs:
           Release notes are available at [dartcode.org/releases/v$MAJOR_MINOR/](https://dartcode.org/releases/v$MAJOR_MINOR/)
           EOF
 
-  post_release_tests:
-
-    name: Post-Release Tests
-    needs: release
-    if: inputs.release_type == 'stable'
-    uses: ./.github/workflows/build-and-test.yml
-    with:
-      ref: v${{ needs.release.outputs.version }}
+      # Tags pushed with GITHUB_TOKEN do not trigger on: push workflows automatically,
+      # so explicitly dispatch a standalone Run Tests workflow run for the new release tag.
+      - name: Trigger full test suite on release tag (stable only)
+        if: inputs.release_type == 'stable'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: gh workflow run build-and-test.yml --ref "v$VERSION"
