@@ -37,8 +37,9 @@ jobs:
     steps:
       - id: no_exclude
         name: Run all builds
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
-        # On scheduled runs, manual workflow dispatches, and tag pushes, run the full matrix across
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') || inputs.ref != ''
+        # On scheduled runs, manual workflow dispatches, reusable workflow calls (which inherit
+        # workflow_dispatch and pass inputs.ref), and tag pushes, run the full matrix across
         # all OSes and SDK channels.
         run: echo 'excludes=[]' >> $GITHUB_OUTPUT
       - id: exclude_master
@@ -74,6 +75,8 @@ jobs:
 
     strategy:
       fail-fast: false
+      # build-version and bot dimensions intentionally mirror Dart-Code's matrix structure
+      # so build_exclusions and merge-guard behave identically when testing workflows.
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         node-version: [22]
@@ -142,7 +145,8 @@ jobs:
             package.json
 
   # A single action based on the test outcome that can be used
-  # as a required status check.
+  # as a required status check. link_check is intentionally excluded
+  # (matching Dart-Code) so external website link failures do not block PR merges.
   merge-guard:
     permissions:
       contents: none

@@ -54,7 +54,7 @@ jobs:
       id-token: write
       actions: read
     outputs:
-      version: ${{ steps.prepare.outputs.version }}
+      version: ${{ steps.version.outputs.version }}
 
     steps:
 
@@ -70,162 +70,111 @@ jobs:
         with:
           node-version: 22
 
-      - name: Prepare version and verify repository state
-        id: prepare
+      - name: Compute and validate version
+        id: version
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO_OWNER: ${{ github.repository_owner }}
-          REPO_NAME: ${{ github.event.repository.name }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           RELEASE_TYPE: ${{ inputs.release_type }}
           INPUT_VERSION: ${{ inputs.version }}
-          SKIP_CI_CHECK: ${{ inputs.skip_ci_check }}
         run: |
-          if [[ "$GITHUB_REF" != refs/heads/* ]]; then
-            echo "::error::Releases must be run from a branch (found '$GITHUB_REF')."
-            exit 1
-          fi
-
           PKG_NAME=$(node -p "require('./package.json').name")
           PKG_VERSION=$(node -p "require('./package.json').version")
 
-          if [ "$RELEASE_TYPE" = "stable" ] && [ -z "$INPUT_VERSION" ]; then
-            echo "::error::An explicit version (X.Y.Z) is required for stable releases."
-            exit 1
-          fi
-
-          if [ -n "$INPUT_VERSION" ]; then
-            if [[ ! "$INPUT_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-              echo "::error::Version '$INPUT_VERSION' must match 'X.Y.Z'."
+          if [ -z "$INPUT_VERSION" ]; then
+            if [ "$RELEASE_TYPE" = "stable" ]; then
+              echo "::error::An explicit version (X.Y.Z) is required for stable releases."
               exit 1
             fi
-            MAJOR="${BASH_REMATCH[1]}"
-            MINOR="${BASH_REMATCH[2]}"
-            PATCH="${BASH_REMATCH[3]}"
-            if [ "$RELEASE_TYPE" = "stable" ] && [ $((MINOR % 2)) -ne 0 ]; then
-              echo "::error::Stable version '$INPUT_VERSION' must have an even minor version."
-              exit 1
-            fi
-            if [ "$RELEASE_TYPE" = "pre-release" ] && [ $((MINOR % 2)) -ne 1 ]; then
-              echo "::error::Pre-release version '$INPUT_VERSION' must have an odd minor version."
-              exit 1
-            fi
-            VERSION="$INPUT_VERSION"
-          else
             if [[ ! "$PKG_VERSION" =~ ^([0-9]+)\.([0-9]+)\.0-dev$ ]]; then
               echo "::error::Expected package.json version to match 'X.Y.0-dev', but found '$PKG_VERSION'."
               exit 1
             fi
-            MAJOR="${BASH_REMATCH[1]}"
-            MINOR=$(( ${BASH_REMATCH[2]} - 1 ))
-            PATCH=$(date -u +%Y%m%d)
-            VERSION="${MAJOR}.${MINOR}.${PATCH}"
+            VERSION="${BASH_REMATCH[1]}.$(( ${BASH_REMATCH[2]} - 1 )).$(date -u +%Y%m%d)"
+          else
+            VERSION="$INPUT_VERSION"
+          fi
+
+          if [[ ! "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::Version '$VERSION' must match 'X.Y.Z'."
+            exit 1
+          fi
+          MAJOR="${BASH_REMATCH[1]}"
+          MINOR="${BASH_REMATCH[2]}"
+          PATCH="${BASH_REMATCH[3]}"
+
+          if [ "$RELEASE_TYPE" = "stable" ] && [ $((MINOR % 2)) -ne 0 ]; then
+            echo "::error::Stable version '$VERSION' must have an even minor version."
+            exit 1
+          fi
+          if [ "$RELEASE_TYPE" = "pre-release" ] && [ $((MINOR % 2)) -ne 1 ]; then
+            echo "::error::Pre-release version '$VERSION' must have an odd minor version."
+            exit 1
+          fi
+
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "::error::Git tag 'v$VERSION' already exists."
+            exit 1
+          fi
+
+          NEXT_DEV_VERSION=""
+          if [ "$RELEASE_TYPE" = "stable" ] && [ "$PATCH" -eq 0 ]; then
+            NEXT_DEV_VERSION="${MAJOR}.$((MINOR + 2)).0-dev"
           fi
 
           VSIX="${PKG_NAME}-${VERSION}.vsix"
-          ALREADY_PUSHED="false"
-          NEXT_DEV_VERSION=""
-
-          # If tag v$VERSION already exists, only allow proceeding if this is a stable release
-          # retry where the GitHub Release (or its VSIX asset) has not been completed yet.
-          if git rev-parse "v$VERSION^{commit}" >/dev/null 2>&1; then
-            EXISTING_ASSET=""
-            if [ "$RELEASE_TYPE" = "stable" ] && gh release view "v$VERSION" >/dev/null 2>&1; then
-              EXISTING_ASSET=$(gh release view "v$VERSION" --json assets | jq -r --arg name "$VSIX" '.assets[] | select(.name == $name) | .name')
-            fi
-            if [ "$RELEASE_TYPE" = "stable" ] && [ -z "$EXISTING_ASSET" ]; then
-              echo "Tag 'v$VERSION' was already pushed but GitHub Release is incomplete; checking out 'v$VERSION' to retry."
-              git checkout --recurse-submodules "v$VERSION"
-              ALREADY_PUSHED="true"
-            else
-              echo "::error::Release 'v$VERSION' has already been published."
-              exit 1
-            fi
-          else
-            # Validate version against current package.json on fresh runs.
-            if [ "$RELEASE_TYPE" = "pre-release" ]; then
-              EXPECTED_DEV="${MAJOR}.$((MINOR + 1)).0-dev"
-              if [ "$PKG_VERSION" != "$EXPECTED_DEV" ]; then
-                echo "::error::Pre-release version '$VERSION' requires package.json to be '$EXPECTED_DEV', but found '$PKG_VERSION'."
-                exit 1
-              fi
-            elif [ "$GITHUB_REF_NAME" = "$DEFAULT_BRANCH" ]; then
-              if [ "$PATCH" -ne 0 ] || [ "$PKG_VERSION" != "${MAJOR}.${MINOR}.0-dev" ]; then
-                echo "::error::Stable release '$VERSION' on $DEFAULT_BRANCH requires patch=0 and package.json '${MAJOR}.${MINOR}.0-dev' (found '$PKG_VERSION')."
-                exit 1
-              fi
-              NEXT_DEV_VERSION="${MAJOR}.$((MINOR + 2)).0-dev"
-            else
-              if [ "$PATCH" -eq 0 ] || [[ "$PKG_VERSION" != "${MAJOR}.${MINOR}."* ]]; then
-                echo "::error::Patch release '$VERSION' on branch '$GITHUB_REF_NAME' requires patch>0 and matching major.minor in package.json (found '$PKG_VERSION')."
-                exit 1
-              fi
-            fi
-
-            # Verify Merge Queue on target branch is empty.
-            QUEUE_JSON=$(gh api graphql -f query='
-              query($owner: String!, $name: String!, $branch: String!) {
-                repository(owner: $owner, name: $name) {
-                  mergeQueue(branch: $branch) {
-                    entries(first: 20) {
-                      totalCount
-                      nodes {
-                        pullRequest {
-                          number
-                          title
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            ' -f owner="$REPO_OWNER" -f name="$REPO_NAME" -f branch="$GITHUB_REF_NAME")
-
-            TOTAL_COUNT=$(echo "$QUEUE_JSON" | jq -r '.data.repository.mergeQueue.entries.totalCount // 0')
-            if [ "$TOTAL_COUNT" -gt 0 ]; then
-              echo "::error::Merge queue on $GITHUB_REF_NAME is not empty ($TOTAL_COUNT PR(s) queued):"
-              echo "$QUEUE_JSON" | jq -r '.data.repository.mergeQueue.entries.nodes[].pullRequest | "  - #\(.number): \(.title)"'
-              exit 1
-            fi
-
-            # Verify latest build-and-test.yml run on the latest non-bot commit succeeded.
-            if [ "$SKIP_CI_CHECK" != "true" ]; then
-              TARGET_SHA=$(git log -n 1 --invert-grep --author="github-actions\[bot\]" --format=%H HEAD)
-              RUN_JSON=$(gh run list --workflow=build-and-test.yml --commit="$TARGET_SHA" --json event,status,conclusion,url \
-                --jq '[.[] | select(.event != "merge_group")][0]')
-
-              if [ -z "$RUN_JSON" ] || [ "$RUN_JSON" = "null" ]; then
-                echo "::error::No 'Run Tests' (build-and-test.yml) run found for commit $TARGET_SHA. Wait for CI to start and finish, or re-run the Release workflow with 'skip_ci_check' enabled to override."
-                exit 1
-              fi
-
-              RUN_STATUS=$(echo "$RUN_JSON" | jq -r '.status')
-              RUN_CONCLUSION=$(echo "$RUN_JSON" | jq -r '.conclusion')
-              RUN_URL=$(echo "$RUN_JSON" | jq -r '.url')
-
-              if [ "$RUN_STATUS" != "completed" ]; then
-                echo "::error::'Run Tests' on commit $TARGET_SHA is still in progress (status: $RUN_STATUS, $RUN_URL). Wait for it to complete and click 'Re-run failed jobs' on this release, or trigger a new Release run with 'skip_ci_check' enabled to override."
-                exit 1
-              fi
-
-              if [ "$RUN_CONCLUSION" != "success" ]; then
-                echo "::error::'Run Tests' on commit $TARGET_SHA did not pass (conclusion: $RUN_CONCLUSION, $RUN_URL). Fix or re-run the failed CI jobs, or trigger a new Release run with 'skip_ci_check' enabled to override."
-                exit 1
-              fi
-
-              echo "Verified 'Run Tests' succeeded on commit $TARGET_SHA ($RUN_URL)."
-            fi
-          fi
-
           {
             echo "version=$VERSION"
             echo "vsix=$VSIX"
             echo "pkg_name=$PKG_NAME"
             echo "next_dev_version=$NEXT_DEV_VERSION"
-            echo "already_pushed=$ALREADY_PUSHED"
           } >> "$GITHUB_OUTPUT"
-
           echo "Prepared $RELEASE_TYPE v$VERSION ($VSIX)"
+
+      - name: Verify Merge Queue is empty
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          TOTAL_COUNT=$(gh api graphql \
+            -f query='query($o:String!,$r:String!,$b:String!){repository(owner:$o,name:$r){mergeQueue(branch:$b){entries{totalCount}}}}' \
+            -f o="$REPO_OWNER" -f r="$REPO_NAME" -f b="$GITHUB_REF_NAME" \
+            --jq '.data.repository.mergeQueue.entries.totalCount // 0')
+          if [ "$TOTAL_COUNT" -gt 0 ]; then
+            echo "::error::Merge queue on $GITHUB_REF_NAME is not empty ($TOTAL_COUNT PR(s) queued)."
+            exit 1
+          fi
+
+      - name: Verify CI passed on target commit
+        if: inputs.skip_ci_check != true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Find the latest commit not authored by github-actions[bot] (since automated version-bump
+          # commits pushed with GITHUB_TOKEN do not trigger on: push CI runs).
+          TARGET_SHA=$(git log -n 1 --perl-regexp --author='^(?!github-actions\[bot\])' --format=%H HEAD)
+          RUN_JSON=$(gh run list --workflow=build-and-test.yml --commit="$TARGET_SHA" --json event,status,conclusion,url \
+            --jq '[.[] | select(.event != "merge_group")][0]')
+
+          if [ -z "$RUN_JSON" ] || [ "$RUN_JSON" = "null" ]; then
+            echo "::error::No 'Run Tests' (build-and-test.yml) run found for commit $TARGET_SHA. Wait for CI to start and finish, or re-run the Release workflow with 'skip_ci_check' enabled to override."
+            exit 1
+          fi
+
+          RUN_STATUS=$(echo "$RUN_JSON" | jq -r '.status')
+          RUN_CONCLUSION=$(echo "$RUN_JSON" | jq -r '.conclusion')
+          RUN_URL=$(echo "$RUN_JSON" | jq -r '.url')
+
+          if [ "$RUN_STATUS" != "completed" ]; then
+            echo "::error::'Run Tests' on commit $TARGET_SHA is still in progress (status: $RUN_STATUS, $RUN_URL). Wait for it to complete and click 'Re-run failed jobs' on this release, or trigger a new Release run with 'skip_ci_check' enabled to override."
+            exit 1
+          fi
+
+          if [ "$RUN_CONCLUSION" != "success" ]; then
+            echo "::error::'Run Tests' on commit $TARGET_SHA did not pass (conclusion: $RUN_CONCLUSION, $RUN_URL). Fix or re-run the failed CI jobs, or trigger a new Release run with 'skip_ci_check' enabled to override."
+            exit 1
+          fi
+
+          echo "Verified 'Run Tests' succeeded on commit $TARGET_SHA ($RUN_URL)."
 
       - name: npm ci
         run: npm ci
@@ -233,20 +182,37 @@ jobs:
       - name: npm run lint
         run: npm run lint
 
-      - name: Package and publish extension (.vsix)
+      - name: Package extension (.vsix)
+        env:
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          VERSION: ${{ steps.version.outputs.version }}
+          VSIX: ${{ steps.version.outputs.vsix }}
+        run: |
+          npm version "$VERSION" --no-git-tag-version
+          if [ "$RELEASE_TYPE" = "pre-release" ]; then
+            npx vsce package --pre-release -o "$VSIX"
+          else
+            npx vsce package -o "$VSIX"
+          fi
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.version.outputs.vsix }}
+          path: ${{ steps.version.outputs.vsix }}
+          overwrite: true
+          if-no-files-found: error
+
+      - name: Publish to VS Code Marketplace
         env:
           DRY_RUN: ${{ inputs.dry_run }}
           RELEASE_TYPE: ${{ inputs.release_type }}
-          VERSION: ${{ steps.prepare.outputs.version }}
-          VSIX: ${{ steps.prepare.outputs.vsix }}
+          VSIX: ${{ steps.version.outputs.vsix }}
         run: |
           PRE_FLAG=""
           if [ "$RELEASE_TYPE" = "pre-release" ]; then
             PRE_FLAG="--pre-release"
           fi
-
-          npm version "$VERSION" --no-git-tag-version --allow-same-version
-          npx vsce package $PRE_FLAG -o "$VSIX"
 
           if [ "$DRY_RUN" = "true" ]; then
             if [ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
@@ -258,20 +224,11 @@ jobs:
             npx vsce publish --oidc --skip-duplicate $PRE_FLAG --packagePath "$VSIX"
           fi
 
-      - name: Upload VSIX artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ steps.prepare.outputs.vsix }}
-          path: ${{ steps.prepare.outputs.vsix }}
-          overwrite: true
-          if-no-files-found: error
-
       - name: Commit, Tag, and Push
-        if: steps.prepare.outputs.already_pushed != 'true'
         env:
           RELEASE_TYPE: ${{ inputs.release_type }}
-          VERSION: ${{ steps.prepare.outputs.version }}
-          NEXT_DEV_VERSION: ${{ steps.prepare.outputs.next_dev_version }}
+          VERSION: ${{ steps.version.outputs.version }}
+          NEXT_DEV_VERSION: ${{ steps.version.outputs.next_dev_version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -293,21 +250,10 @@ jobs:
         if: inputs.release_type == 'stable'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ steps.prepare.outputs.version }}
-          VSIX: ${{ steps.prepare.outputs.vsix }}
-          PKG_NAME: ${{ steps.prepare.outputs.pkg_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+          VSIX: ${{ steps.version.outputs.vsix }}
+          PKG_NAME: ${{ steps.version.outputs.pkg_name }}
         run: |
-          if gh release view "v$VERSION" >/dev/null 2>&1; then
-            EXISTING_ASSET=$(gh release view "v$VERSION" --json assets | jq -r --arg name "$VSIX" '.assets[] | select(.name == $name) | .name')
-            if [ -z "$EXISTING_ASSET" ]; then
-              echo "GitHub Release 'v$VERSION' exists but is missing '$VSIX'; uploading asset..."
-              gh release upload "v$VERSION" "$VSIX"
-            else
-              echo "GitHub Release 'v$VERSION' and asset '$VSIX' already exist."
-            fi
-            exit 0
-          fi
-
           MAJOR_MINOR=$(echo "$VERSION" | cut -d. -f1,2 | tr '.' '-')
           if [ "$PKG_NAME" = "dart-code" ]; then
             RELEASE_TITLE="Dart Code v$VERSION"
