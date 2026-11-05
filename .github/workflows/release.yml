@@ -1,9 +1,9 @@
 name: Release
 
-# Packages a single release (pre-release or stable) into a VSIX, tags the commit,
-# and (for stable releases) creates a GitHub Release with the VSIX.
+# Publishes a single release (pre-release or stable) to the VS Code Marketplace,
+# tags the commit, and (for stable releases) creates a GitHub Release with the VSIX.
 #
-# Note: When releasing a '.0' stable release (e.g. 3.148.0), the workflow opens a PR
+# Note: When publishing a '.0' stable release (e.g. 3.148.0), the workflow opens a PR
 # to bump package.json to the next '-dev' version (e.g. 3.150.0-dev). To publish the
 # first pre-release for the next cycle (e.g. 3.149.YYYYMMDD), either merge that PR
 # first (so the version is auto-calculated) or pass the version explicitly.
@@ -20,7 +20,7 @@ on:
           - stable
         default: pre-release
       version:
-        description: "Version to release (X.Y.Z). Required for stable; leave blank for pre-release to auto-calculate."
+        description: "Version to publish (X.Y.Z). Required for stable; leave blank for pre-release to auto-calculate."
         required: false
         type: string
         default: ""
@@ -29,6 +29,11 @@ on:
         required: false
         type: boolean
         default: false
+      dry_run:
+        description: "Dry run (skip publishing to VS Code Marketplace, but still commit/tag/release)"
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -47,6 +52,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      id-token: write
       # actions: write is required to read CI runs (gh run list) and to dispatch the
       # standalone post-release test workflow run (gh workflow run).
       actions: write
@@ -212,6 +218,28 @@ jobs:
           overwrite: true
           if-no-files-found: error
 
+      - name: Publish to VS Code Marketplace
+        id: publish
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          VSIX: ${{ steps.version.outputs.vsix }}
+        run: |
+          PRE_FLAG=""
+          if [ "$RELEASE_TYPE" = "pre-release" ]; then
+            PRE_FLAG="--pre-release"
+          fi
+
+          if [ "$DRY_RUN" = "true" ]; then
+            if [ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+              echo "::error::OIDC token environment variables are missing (check id-token: write permission)."
+              exit 1
+            fi
+            echo "[Dry Run] Would execute: npx @vscode/vsce publish --oidc --skip-duplicate $PRE_FLAG --packagePath $VSIX"
+          else
+            npx @vscode/vsce publish --oidc --skip-duplicate $PRE_FLAG --packagePath "$VSIX"
+          fi
+
       - name: Commit and push tag
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -289,3 +317,10 @@ jobs:
           # PRs created with GITHUB_TOKEN do not trigger on: pull_request workflows automatically,
           # so dispatch Run Tests on the PR branch so Merge Guard runs and allows merging.
           gh workflow run build-and-test.yml --ref "$BRANCH_NAME"
+
+      - name: Print retry instructions on failure
+        if: failure() && steps.publish.outcome == 'success'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          echo "::warning::A step failed after v$VERSION was published to the VS Code Marketplace. Because 'vsce publish' uses '--skip-duplicate', it is safe to re-run this job (if the tag 'v$VERSION' or GitHub Release was already created, delete it first with 'gh release delete v$VERSION --yes' / 'git push --delete origin v$VERSION')."
