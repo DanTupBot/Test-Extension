@@ -3,10 +3,10 @@ name: Release
 # Packages a single release (pre-release or stable) into a VSIX, tags the commit,
 # and (for stable releases) creates a GitHub Release with the VSIX.
 #
-# Note: When releasing both a stable release (e.g. 3.148.0) and the first pre-release
-# for the next cycle (e.g. 3.149.YYYYMMDD), ensure the stable release is approved and
-# completes first so that package.json is bumped to 3.150.0-dev before the pre-release
-# run checks out the branch and auto-calculates its version.
+# Note: When releasing a '.0' stable release (e.g. 3.148.0), the workflow opens a PR
+# to bump package.json to the next '-dev' version (e.g. 3.150.0-dev). To publish the
+# first pre-release for the next cycle (e.g. 3.149.YYYYMMDD), either merge that PR
+# first (so the version is auto-calculated) or pass the version explicitly.
 
 on:
   workflow_dispatch:
@@ -46,6 +46,7 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: write
+      pull-requests: write
       # actions: write is required to read CI runs (gh run list) and to dispatch the
       # standalone post-release test workflow run (gh workflow run).
       actions: write
@@ -159,9 +160,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Find the latest commit not authored by github-actions[bot] (since automated version-bump
-          # commits pushed with GITHUB_TOKEN do not trigger on: push CI runs).
-          TARGET_SHA=$(git log -n 1 --perl-regexp --author='^(?!github-actions\[bot\])' --format=%H HEAD)
+          TARGET_SHA=$(git rev-parse HEAD)
           RUN_JSON=$(gh run list --workflow=build-and-test.yml --commit="$TARGET_SHA" --json event,status,conclusion,url \
             --jq '[.[] | select(.event != "merge_group")][0]')
 
@@ -213,11 +212,9 @@ jobs:
           overwrite: true
           if-no-files-found: error
 
-      - name: Commit, Tag, and Push
+      - name: Commit and push tag
         env:
-          RELEASE_TYPE: ${{ inputs.release_type }}
           VERSION: ${{ steps.version.outputs.version }}
-          NEXT_DEV_VERSION: ${{ steps.version.outputs.next_dev_version }}
         run: |
           # Use the standard GitHub Actions bot identity (user ID 41898282) so commits are
           # attributed to github-actions[bot] on GitHub.
@@ -226,16 +223,7 @@ jobs:
 
           git commit -am "Publish v$VERSION"
           git tag "v$VERSION"
-
-          if [ "$RELEASE_TYPE" = "pre-release" ]; then
-            git push origin "refs/tags/v$VERSION"
-          else
-            if [ -n "$NEXT_DEV_VERSION" ]; then
-              npm version "$NEXT_DEV_VERSION" --no-git-tag-version
-              git commit -am "Set version to $NEXT_DEV_VERSION"
-            fi
-            git push --atomic origin "HEAD:$GITHUB_REF_NAME" "refs/tags/v$VERSION"
-          fi
+          git push origin "refs/tags/v$VERSION"
 
       - name: Create GitHub Release (stable only)
         if: inputs.release_type == 'stable'
@@ -274,3 +262,30 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.version.outputs.version }}
         run: gh workflow run build-and-test.yml --ref "v$VERSION"
+
+      # Protected branches with a Merge Queue reject direct pushes from GITHUB_TOKEN,
+      # so open a PR to advance package.json to the next '-dev' version.
+      - name: Open PR for next -dev version (stable .0 releases only)
+        if: steps.version.outputs.next_dev_version != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          NEXT_DEV_VERSION: ${{ steps.version.outputs.next_dev_version }}
+        run: |
+          BRANCH_NAME="release/set-version-$NEXT_DEV_VERSION"
+          git checkout -B "$BRANCH_NAME" HEAD~1
+          npm version "$NEXT_DEV_VERSION" --no-git-tag-version
+          git commit -am "Set version to $NEXT_DEV_VERSION"
+          git push --force origin "HEAD:refs/heads/$BRANCH_NAME"
+
+          if ! gh pr view "$BRANCH_NAME" >/dev/null 2>&1; then
+            gh pr create \
+              --base "$GITHUB_REF_NAME" \
+              --head "$BRANCH_NAME" \
+              --title "Set version to $NEXT_DEV_VERSION" \
+              --body "Automated version bump after releasing v$VERSION."
+          fi
+
+          # PRs created with GITHUB_TOKEN do not trigger on: pull_request workflows automatically,
+          # so dispatch Run Tests on the PR branch so Merge Guard runs and allows merging.
+          gh workflow run build-and-test.yml --ref "$BRANCH_NAME"
