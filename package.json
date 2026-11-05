@@ -1,5 +1,5 @@
 {
-	"name": "test-extension",
+	"name": "dart-code-test-extension",
 	"displayName": "Test Extension",
 	"description": "An extension for testing automated publishing. Not useful to you.",
 	"version": "0.10.0-dev",
