@@ -46,6 +46,8 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: write
+      # actions: write is required to read CI runs (gh run list) and to dispatch the
+      # standalone post-release test workflow run (gh workflow run).
       actions: write
 
     steps:
@@ -110,8 +112,12 @@ jobs:
             exit 1
           fi
 
+          # Intentionally fail if the tag already exists rather than attempting complex in-place
+          # retry recovery after git push. If 'gh release create' fails after the tag is pushed,
+          # the release can be created manually from the pushed tag and uploaded VSIX workflow
+          # artifact (or the tag/commit can be deleted before re-running).
           if git rev-parse "v$VERSION" >/dev/null 2>&1; then
-            echo "::error::Git tag 'v$VERSION' already exists. Check that the version number is correct, or if you are retrying a failed release, delete the existing 'v$VERSION' tag (and any partial GitHub Release) before re-running."
+            echo "::error::Git tag 'v$VERSION' already exists. Check that the version number is correct, or if you are retrying a failed release, delete the existing 'v$VERSION' tag (and any partial GitHub Release) or create the GitHub Release manually from the pushed tag and uploaded VSIX artifact."
             exit 1
           fi
 
