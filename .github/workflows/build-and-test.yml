@@ -146,7 +146,7 @@ jobs:
 
   # A single action based on the test outcome that can be used
   # as a required status check. link_check is intentionally excluded
-  # (matching Dart-Code) so external website link failures do not block PR merges.
+  # so external website link failures do not block PR merges.
   merge-guard:
     permissions:
       contents: none
