@@ -301,7 +301,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           NEXT_DEV_VERSION: ${{ steps.version.outputs.next_dev_version }}
         run: |
-          BRANCH_NAME="release/set-version-$NEXT_DEV_VERSION"
+          BRANCH_NAME="version-bump/$NEXT_DEV_VERSION"
           git checkout -B "$BRANCH_NAME" HEAD~1
           npm version "$NEXT_DEV_VERSION" --no-git-tag-version
           git commit -am "Set version to $NEXT_DEV_VERSION"
