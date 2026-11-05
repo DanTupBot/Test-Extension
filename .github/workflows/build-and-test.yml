@@ -98,7 +98,15 @@ jobs:
 
       - name: Delay on merge queue (to allow testing non-empty merge queue guard)
         if: github.event_name == 'merge_group'
-        run: sleep 45
+        run: sleep 90
+        shell: bash
+
+      - name: Slow and failing check on push (to test in-progress and failed CI checks)
+        if: github.event_name == 'push'
+        run: |
+          sleep 90
+          echo "::error::Intentional failure on push for testing release.yml CI check guard"
+          exit 1
         shell: bash
 
       - name: Set up Node v${{ matrix.node-version }}
