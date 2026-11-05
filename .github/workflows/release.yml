@@ -76,6 +76,7 @@ jobs:
           #   because the VS Code Marketplace does not support semver pre-release suffixes like '-dev'.
           # - Between releases, package.json on the default branch sits at the next EVEN minor version
           #   with a '-dev' suffix (e.g. 3.148.0-dev).
+          PKG_PUBLISHER=$(node -p "require('./package.json').publisher")
           PKG_NAME=$(node -p "require('./package.json').name")
           PKG_VERSION=$(node -p "require('./package.json').version")
 
@@ -132,6 +133,7 @@ jobs:
           {
             echo "version=$VERSION"
             echo "vsix=$VSIX"
+            echo "pkg_publisher=$PKG_PUBLISHER"
             echo "pkg_name=$PKG_NAME"
             echo "next_dev_version=$NEXT_DEV_VERSION"
           } >> "$GITHUB_OUTPUT"
@@ -241,6 +243,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.version.outputs.version }}
           VSIX: ${{ steps.version.outputs.vsix }}
+          PKG_PUBLISHER: ${{ steps.version.outputs.pkg_publisher }}
           PKG_NAME: ${{ steps.version.outputs.pkg_name }}
         run: |
           MAJOR_MINOR=$(echo "$VERSION" | cut -d. -f1,2 | tr '.' '-')
@@ -258,7 +261,7 @@ jobs:
           sed 's/^          //' <<EOF | gh release create "v$VERSION" "$VSIX" --title "$RELEASE_TITLE" --notes-file -
           ## Installation
 
-          $INSTALL_TEXT can be [installed from the Visual Studio Code Marketplace](https://marketplace.visualstudio.com/items?itemName=Dart-Code.$PKG_NAME).
+          $INSTALL_TEXT can be [installed from the Visual Studio Code Marketplace](https://marketplace.visualstudio.com/items?itemName=$PKG_PUBLISHER.$PKG_NAME).
 
           Release notes are available at [dartcode.org/releases/v$MAJOR_MINOR/](https://dartcode.org/releases/v$MAJOR_MINOR/)
           EOF
