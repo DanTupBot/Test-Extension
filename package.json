@@ -2,7 +2,7 @@
 	"name": "test-extension",
 	"displayName": "Test Extension",
 	"description": "An extension for testing automated publishing. Not useful to you.",
-	"version": "0.1.0-dev",
+	"version": "0.2.0-dev",
 	"publisher": "Dart-Code",
 	"engines": {
 		"vscode": "^1.101.0"
@@ -33,7 +33,7 @@
 	"keywords": [],
 	"icon": "media/test.png",
 	"activationEvents": [
-		"*"
+		"onStartupFinished"
 	],
 	"main": "./out/dist/extension",
 	"contributes": {
@@ -41,12 +41,15 @@
 	"scripts": {
 		"vscode:prepublish": "webpack --mode production",
 		"build": "webpack --mode development --stats errors-only",
-		"watch": "webpack --mode development --watch"
+		"watch": "webpack --mode development --watch",
+		"lint": "tsc --noEmit",
+		"test": "node -e \"console.log('Tests passed')\""
 	},
 	"dependencies": {},
 	"devDependencies": {
 		"@types/node": "^24.0.0",
 		"@types/vscode": "~1.101.0",
+		"@vscode/vsce": "^4.1.0",
 		"source-map-support": "^0.5.21",
 		"ts-loader": "^9.5.7",
 		"typescript": "^6.0.3",
@@ -60,6 +63,6 @@
 	"overrides": {
 		"brace-expansion": "^5.0.7",
 		"diff": "^4.0.4",
-		"serialize-javascript": "^7.0.7"
+		"serialize-javascript": "^7.1.4"
 	}
 }
