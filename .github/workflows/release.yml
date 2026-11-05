@@ -219,6 +219,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish to VS Code Marketplace
+        id: publish
         env:
           DRY_RUN: ${{ inputs.dry_run }}
           RELEASE_TYPE: ${{ inputs.release_type }}
@@ -316,3 +317,10 @@ jobs:
           # PRs created with GITHUB_TOKEN do not trigger on: pull_request workflows automatically,
           # so dispatch Run Tests on the PR branch so Merge Guard runs and allows merging.
           gh workflow run build-and-test.yml --ref "$BRANCH_NAME"
+
+      - name: Print retry instructions on failure
+        if: failure() && steps.publish.outcome == 'success'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          echo "::warning::A step failed after v$VERSION was published to the VS Code Marketplace. Because 'vsce publish' uses '--skip-duplicate', it is safe to re-run this job (if the tag 'v$VERSION' or GitHub Release was already created, delete it first with 'gh release delete v$VERSION --yes' / 'git push --delete origin v$VERSION')."
