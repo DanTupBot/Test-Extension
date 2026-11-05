@@ -1,4 +1,5 @@
 name: Release
+run-name: Release ${{ inputs.release_type }}${{ inputs.version && format(' v{0}', inputs.version) || '' }}${{ inputs.dry_run && ' (dry run)' || '' }}
 
 # Publishes a single release (pre-release or stable) to the VS Code Marketplace,
 # tags the commit, and (for stable releases) creates a GitHub Release with the VSIX.
