@@ -46,7 +46,7 @@ jobs:
     name: Release Extension
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    environment: release2
+    environment: release
     concurrency:
       group: release
       cancel-in-progress: false
